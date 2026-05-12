@@ -9,7 +9,6 @@ import { safeError } from '../middleware/errors';
 import { log } from '../middleware/logging';
 import { isAuthorizedWithAdminKey } from '../middleware/auth';
 import { loadConfig } from '../utils/config';
-import { closeBrowser } from '../services/browser';
 import { contextPool } from '../services/context-pool';
 import {
 	MAX_TABS_PER_SESSION,
@@ -150,7 +149,6 @@ router.post('/stop', async (req: Request, res: Response) => {
 		}
 
 		await closeAllSessions();
-		await closeBrowser();
 		clearAllState();
 		res.json({ ok: true, stopped: true, profile: 'camoufox' });
 	} catch (err) {

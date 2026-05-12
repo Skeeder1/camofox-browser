@@ -112,25 +112,6 @@ export function registerDownloadCommands(program: Command, context: CliContext):
 		});
 
 	program
-		.command('download')
-		.argument('[url]', 'URL to download')
-		.option('--path <dir>', 'download target directory')
-		.option('--user <user>', 'user id')
-		.action(async (_url: string | undefined, options: { path?: string; user?: string }, command: Command) => {
-			try {
-				void options;
-				context.print(command, {
-					ok: false,
-					requires: 'server v2.0+',
-					message:
-						'The "download" command requires a server v2.0+ direct download endpoint, which is not available on this server. Use "camofox downloads" to inspect completed downloads or call batch download on a tab via the API.',
-				});
-			} catch (error) {
-				context.handleError(error);
-			}
-		});
-
-	program
 		.command('downloads')
 		.option('--user <user>', 'user id')
 		.option('--format <format>', 'output format: json|text|plain')

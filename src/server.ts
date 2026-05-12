@@ -7,7 +7,6 @@ import openclawRoutes from './routes/openclaw';
 import { installCrashHandlers, safeError } from './middleware/errors';
 import { loggingMiddleware, log, startStatsBeacon } from './middleware/logging';
 import { loadConfig } from './utils/config';
-import { closeBrowser } from './services/browser';
 import { contextPool } from './services/context-pool';
 import {
 	closeAllSessions,
@@ -29,6 +28,15 @@ const CONFIG = loadConfig();
 const app = express();
 app.use(express.json({ limit: '100kb' }));
 app.use(loggingMiddleware);
+
+// Track last activity time for idle shutdown (updated on every non-health request)
+let lastActivityAt = Date.now();
+app.use((req, _res, next) => {
+	if (req.path !== '/health' && req.path !== '/') {
+		lastActivityAt = Date.now();
+	}
+	next();
+});
 
 app.use(coreRoutes);
 app.use(openclawRoutes);
@@ -55,6 +63,7 @@ startStatsBeacon(() => {
 const PORT = CONFIG.port;
 let server: Server;
 let healthProbeInterval: NodeJS.Timeout | null = null;
+let idleShutdownInterval: NodeJS.Timeout | null = null;
 
 void detectYtDlp((message: unknown) => {
 	log('info', 'yt-dlp detection', { message: String(message) });
@@ -79,6 +88,11 @@ async function gracefulShutdown(signal: string): Promise<void> {
 		// ignore
 	}
 
+	if (idleShutdownInterval) {
+		clearInterval(idleShutdownInterval);
+		idleShutdownInterval = null;
+	}
+
 	await closeAllSessions().catch(() => {});
 	stopAllVnc();
 	stopSessionCleanupInterval();
@@ -87,7 +101,6 @@ async function gracefulShutdown(signal: string): Promise<void> {
 		clearInterval(healthProbeInterval);
 		healthProbeInterval = null;
 	}
-	await closeBrowser().catch(() => {});
 	process.exit(0);
 }
 
@@ -111,6 +124,18 @@ server = app.listen(PORT, () => {
 		});
 	}, CONFIG.healthProbeIntervalMs);
 	healthProbeInterval.unref();
+
+	// Idle shutdown: exit if no activity for CAMOFOX_IDLE_TIMEOUT_MS (default 15min)
+	if (CONFIG.idleTimeoutMs > 0) {
+		idleShutdownInterval = setInterval(() => {
+			const idle = Date.now() - lastActivityAt;
+			if (idle >= CONFIG.idleTimeoutMs) {
+				log('info', 'idle timeout reached, shutting down', { idleMs: idle, limitMs: CONFIG.idleTimeoutMs });
+				void gracefulShutdown('IDLE_TIMEOUT');
+			}
+		}, 60_000);
+		idleShutdownInterval.unref();
+	}
 	if (!CONFIG.apiKey) {
 		console.warn('[camofox] ⚠️  CAMOFOX_API_KEY not set — all endpoints are open without authentication.');
 		console.warn('[camofox] Set CAMOFOX_API_KEY for production/network-exposed deployments.');

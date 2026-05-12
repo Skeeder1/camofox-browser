@@ -21,10 +21,6 @@ const NOVNC_PATH = '/opt/noVNC';
 const BASE_WS_PORT = Math.max(1, Number.parseInt(process.env.CAMOFOX_VNC_BASE_PORT || '', 10) || 6080);
 const VNC_HOST = process.env.CAMOFOX_VNC_HOST || 'localhost';
 
-export function getVncSession(userId: string): VncSession | undefined {
-	return vncSessions.get(String(userId));
-}
-
 function normalizeDisplay(displayNum: string): string {
 	const cleaned = String(displayNum || '').trim();
 	if (!cleaned.startsWith(':')) {

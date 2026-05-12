@@ -26,7 +26,7 @@ if (typeof pkg.version !== 'string' || !pkg.version.trim()) {
 }
 const CLI_VERSION = pkg.version;
 
-function getGlobalOptions(command: Command): { port?: string; format?: OutputFormat; local?: boolean } {
+function getGlobalOptions(command: Command): { port?: string; format?: OutputFormat } {
 	const withGlobals = command.optsWithGlobals();
 	return withGlobals as { port?: string; format?: OutputFormat; local?: boolean };
 }
@@ -41,7 +41,6 @@ export async function run(argv = process.argv): Promise<void> {
 		.option('--user <user>', 'default user id (overrides CAMOFOX_CLI_USER)')
 		.option('--port <port>', 'server port (overrides CAMOFOX_PORT)')
 		.option('--format <format>', 'output format: json|text|plain', 'text')
-		.option('--local', 'reserved for v2')
 		.showHelpAfterError();
 
 	let transport: HttpTransport | undefined;
@@ -73,10 +72,6 @@ export async function run(argv = process.argv): Promise<void> {
 
 	program.hook('preAction', async (_thisCommand, actionCommand) => {
 		const globalOptions = getGlobalOptions(actionCommand);
-		if (globalOptions.local) {
-			throw new Error('--local is reserved for v2');
-		}
-
 		const parentName = actionCommand.parent?.name();
 		if (parentName === 'server') {
 			return;

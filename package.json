@@ -1,7 +1,7 @@
 {
   "name": "camofox-browser",
   "version": "2.1.1",
-  "description": "Anti-detection browser server for AI agents — REST API wrapping Camoufox engine with OpenClaw plugin support",
+  "description": "Anti-detection browser server for AI agents — REST API wrapping Camoufox engine with OpenClaw-compatible endpoints",
   "type": "commonjs",
   "main": "dist/src/server.js",
   "bin": {
@@ -44,11 +44,6 @@
     "CHANGELOG.md",
     "LICENSE"
   ],
-  "openclaw": {
-    "extensions": [
-      "plugin.ts"
-    ]
-  },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc",

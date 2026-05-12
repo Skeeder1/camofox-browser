@@ -1,5 +1,3 @@
-import type { NextFunction, Request, Response } from 'express';
-
 import { loadConfig } from '../utils/config';
 import { log } from './logging';
 
@@ -14,12 +12,6 @@ export function safeError(err: unknown): string {
 		return 'Internal server error';
 	}
 	return message;
-}
-
-export function errorMiddleware(err: unknown, req: Request, res: Response, _next: NextFunction): void {
-	log('error', 'request error', { reqId: req.reqId, path: req.path, error: safeError(err) });
-	if (res.headersSent) return;
-	res.status(500).json({ error: safeError(err) });
 }
 
 export function installCrashHandlers(): void {

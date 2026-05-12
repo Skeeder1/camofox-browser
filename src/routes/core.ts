@@ -40,6 +40,7 @@ import {
 	screenshotTab,
 	scrollElementTab,
 	snapshotTab,
+	snapshotTabDialog,
 	calculateTypeTimeoutMs,
 	typeTab,
 	safePageClose,
@@ -440,6 +441,86 @@ router.get('/tabs/:tabId/snapshot', async (req: Request<{ tabId: string }, unkno
 	}
 });
 
+// Task-aware scoped snapshot (POST so we can pass body params)
+router.post('/tabs/:tabId/snapshot', async (req: Request<{ tabId: string }, unknown, {
+	userId?: unknown;
+	focusSelector?: string;
+	maxLines?: number;
+	rolesFilter?: string[];
+	currentTask?: string;
+	lastAction?: string;
+}>, res: Response) => {
+	try {
+		const { userId, focusSelector, maxLines, rolesFilter, currentTask, lastAction } = req.body;
+		if (!userId) return res.status(400).json({ error: 'userId required' });
+		const tabId = req.params.tabId;
+		const found = findTabById(tabId, userId);
+		if (!found) return res.status(404).json({ error: 'Tab not found' });
+
+		const { tabState } = found;
+		tabState.toolCalls++;
+		const opts = {
+			focusSelector: typeof focusSelector === 'string' ? focusSelector : undefined,
+			maxLines: typeof maxLines === 'number' && maxLines > 0 ? Math.min(maxLines, 5000) : undefined,
+			rolesFilter: Array.isArray(rolesFilter) ? rolesFilter.filter((r): r is string => typeof r === 'string') : undefined,
+			currentTask: typeof currentTask === 'string' ? currentTask : undefined,
+			lastAction: typeof lastAction === 'string' ? lastAction : undefined,
+		};
+		const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
+			withTimeout(snapshotTab(tabState, opts), CONFIG.handlerTimeoutMs, 'snapshot-scoped'),
+		);
+		log('info', 'snapshot-scoped', {
+			reqId: req.reqId,
+			tabId,
+			url: result.url,
+			snapshotLen: result.snapshot.length,
+			refsCount: result.refsCount,
+			scoped: result.scoped,
+			focusSelector: opts.focusSelector,
+			rolesFilter: opts.rolesFilter,
+		});
+		return res.json(result);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		log('error', 'snapshot-scoped failed', { reqId: req.reqId, tabId: req.params.tabId, error: message });
+		return res.status(500).json({ error: safeError(err) });
+	}
+});
+
+// Dialog-only snapshot: auto-detects topmost open dialog
+router.post('/tabs/:tabId/snapshot/dialog', async (req: Request<{ tabId: string }, unknown, { userId?: unknown }>, res: Response) => {
+	try {
+		const { userId } = req.body;
+		if (!userId) return res.status(400).json({ error: 'userId required' });
+		const tabId = req.params.tabId;
+		const found = findTabById(tabId, userId);
+		if (!found) return res.status(404).json({ error: 'Tab not found' });
+
+		const { tabState } = found;
+		tabState.toolCalls++;
+		const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
+			withTimeout(snapshotTabDialog(tabState), CONFIG.handlerTimeoutMs, 'snapshot-dialog'),
+		);
+		if (!result) {
+			log('info', 'snapshot-dialog: no dialog visible', { reqId: req.reqId, tabId });
+			return res.json({ url: tabState.page.url(), snapshot: null, refsCount: 0, selector: null });
+		}
+		log('info', 'snapshot-dialog', {
+			reqId: req.reqId,
+			tabId,
+			url: result.url,
+			selector: result.selector,
+			snapshotLen: result.snapshot.length,
+			refsCount: result.refsCount,
+		});
+		return res.json(result);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		log('error', 'snapshot-dialog failed', { reqId: req.reqId, tabId: req.params.tabId, error: message });
+		return res.status(500).json({ error: safeError(err) });
+	}
+});
+
 // Wait for page ready
 router.post('/tabs/:tabId/wait', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; timeout?: number; waitForNetwork?: boolean }>, res: Response) => {
 	try {
@@ -458,17 +539,17 @@ router.post('/tabs/:tabId/wait', async (req: Request<{ tabId: string }, unknown,
 });
 
 // Click
-router.post('/tabs/:tabId/click', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; ref?: string; selector?: string }>, res: Response) => {
+router.post('/tabs/:tabId/click', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; ref?: string; selector?: string; timeout?: number; force?: boolean; verify?: boolean }>, res: Response) => {
 	const tabId = req.params.tabId;
 	try {
-		const { userId, ref, selector } = req.body;
+		const { userId, ref, selector, timeout, force, verify } = req.body;
 		if (!userId) return res.status(400).json({ error: 'userId required' });
 		const found = findTabById(tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
 		const { tabState } = found;
 		tabState.toolCalls++;
 		const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
-			withTimeout(clickTab(tabId, tabState, { ref, selector }), CONFIG.handlerTimeoutMs, 'click'),
+			withTimeout(clickTab(tabId, tabState, { ref, selector, timeout, force, verify }), CONFIG.handlerTimeoutMs, 'click'),
 		);
 		const responseObj: Record<string, unknown> = { ...result };
 		const recentDownloads = getRecentDownloads(tabId, 2000);
@@ -480,7 +561,7 @@ router.post('/tabs/:tabId/click', async (req: Request<{ tabId: string }, unknown
 				size: d.size,
 			}));
 		}
-		log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url });
+		log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url, strategy: result.strategy, attempts: result.attempts });
 		return res.json(responseObj);
 	} catch (err) {
 		const statusCode = (err as { statusCode?: number } | null)?.statusCode;
@@ -794,15 +875,27 @@ router.get(
 );
 
 // Screenshot
-router.get('/tabs/:tabId/screenshot', async (req: Request<{ tabId: string }, unknown, unknown, { userId?: unknown; fullPage?: string }>, res: Response) => {
+router.get('/tabs/:tabId/screenshot', async (req: Request<{ tabId: string }, unknown, unknown, { userId?: unknown; fullPage?: string; type?: string; quality?: string; clipX?: string; clipY?: string; clipW?: string; clipH?: string }>, res: Response) => {
 	try {
 		const userId = req.query.userId;
 		const fullPage = req.query.fullPage === 'true';
 		const found = findTabById(req.params.tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
 		const { tabState } = found;
-		const buffer = await screenshotTab(tabState, fullPage);
-		res.set('Content-Type', 'image/png');
+		const type = req.query.type === 'jpeg' ? 'jpeg' : 'png';
+		const quality = type === 'jpeg' && req.query.quality ? Number(req.query.quality) : undefined;
+		let clip: { x: number; y: number; width: number; height: number } | undefined;
+		if (req.query.clipX && req.query.clipY && req.query.clipW && req.query.clipH) {
+			const x = Number(req.query.clipX);
+			const y = Number(req.query.clipY);
+			const width = Number(req.query.clipW);
+			const height = Number(req.query.clipH);
+			if ([x, y, width, height].every((n) => Number.isFinite(n) && n >= 0) && width > 0 && height > 0) {
+				clip = { x, y, width, height };
+			}
+		}
+		const { buffer, mime } = await screenshotTab(tabState, { fullPage, type, quality, clip });
+		res.set('Content-Type', mime);
 		return res.send(buffer);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);

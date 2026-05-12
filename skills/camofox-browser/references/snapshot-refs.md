@@ -5,7 +5,6 @@ How Camofox assigns, uses, and invalidates element refs in accessibility snapsho
 Related:
 - `../SKILL.md`
 - `./api-endpoints.md`
-- `./openclaw-tools.md`
 
 Source of truth: `AGENTS.md`
 
@@ -46,7 +45,7 @@ In snapshots, refs are shown in brackets beside annotated interactive nodes:
 This differs from ecosystems that annotate as `@eN`. In camofox-browser, use plain `eN` in:
 - CLI commands (`camofox click e5`)
 - API payloads (`{ "ref": "e5" }`)
-- OpenClaw plugin tool calls (`camofox_click` with `ref: "e5"`)
+- OpenClaw-compatible route calls using `ref: "e5"`
 
 ---
 

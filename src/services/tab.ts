@@ -351,16 +351,85 @@ export function buildRefsFromAriaSnapshot(ariaYaml: string | null): Map<string, 
 	return refs;
 }
 
-export async function getAriaSnapshot(page: Page): Promise<string | null> {
+export interface AriaSnapshotOptions {
+	/** CSS selector to scope snapshot to a subtree (e.g. dialog, form). Defaults to body. */
+	focusSelector?: string;
+	/** Hard cap on lines after filtering (heuristic viewport limit). */
+	maxLines?: number;
+	/** Restrict YAML to nodes whose role matches one of these (parents preserved). */
+	rolesFilter?: string[];
+}
+
+export async function getAriaSnapshot(page: Page, options: AriaSnapshotOptions = {}): Promise<string | null> {
 	if (!page || page.isClosed()) return null;
 	await waitForPageReady(page, { waitForNetwork: false });
+	const target = options.focusSelector ? page.locator(options.focusSelector).first() : page.locator('body');
+	let raw: string;
 	try {
-		return await page.locator('body').ariaSnapshot({ timeout: 10000 });
+		raw = await target.ariaSnapshot({ timeout: 10000 });
 	} catch {
 		log('warn', 'ariaSnapshot failed, retrying');
 		await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
-		return page.locator('body').ariaSnapshot({ timeout: 10000 });
+		try {
+			raw = await target.ariaSnapshot({ timeout: 10000 });
+		} catch {
+			return null;
+		}
 	}
+	return postProcessAriaYaml(raw, options);
+}
+
+function postProcessAriaYaml(yaml: string, options: AriaSnapshotOptions): string {
+	let lines = yaml.split('\n');
+	if (options.rolesFilter && options.rolesFilter.length > 0) {
+		const allowed = new Set(options.rolesFilter.map((r) => r.toLowerCase()));
+		const keep = new Array<boolean>(lines.length).fill(false);
+		const indents = lines.map((l) => l.match(/^\s*/)?.[0].length ?? 0);
+		const roles = lines.map((l) => {
+			const m = l.match(/^\s*-\s+(\w+)/);
+			return m ? m[1].toLowerCase() : null;
+		});
+		// First pass: mark direct matches
+		for (let i = 0; i < lines.length; i++) {
+			if (roles[i] && allowed.has(roles[i] as string)) keep[i] = true;
+		}
+		// Second pass: keep ancestor chain of any kept line
+		for (let i = lines.length - 1; i >= 0; i--) {
+			if (!keep[i]) continue;
+			let parentIndent = indents[i];
+			for (let j = i - 1; j >= 0 && parentIndent > 0; j--) {
+				if (indents[j] < parentIndent) {
+					keep[j] = true;
+					parentIndent = indents[j];
+				}
+			}
+		}
+		lines = lines.filter((_, i) => keep[i]);
+	}
+	if (options.maxLines && lines.length > options.maxLines) {
+		lines = lines.slice(0, options.maxLines);
+		lines.push(`# ... truncated to ${options.maxLines} lines`);
+	}
+	return lines.join('\n');
+}
+
+/** Locate the topmost open Radix/ARIA dialog and snapshot it. */
+export async function getDialogAriaSnapshot(page: Page): Promise<{ snapshot: string; selector: string } | null> {
+	if (!page || page.isClosed()) return null;
+	const candidates = [
+		'[role="dialog"][data-state="open"]',
+		'[role="alertdialog"][data-state="open"]',
+		'[role="dialog"]:not([aria-hidden="true"])',
+		'[role="alertdialog"]:not([aria-hidden="true"])',
+	];
+	for (const sel of candidates) {
+		const loc = page.locator(sel).last();
+		if ((await loc.count().catch(() => 0)) > 0 && (await loc.isVisible().catch(() => false))) {
+			const snap = await getAriaSnapshot(page, { focusSelector: sel });
+			if (snap) return { snapshot: snap, selector: sel };
+		}
+	}
+	return null;
 }
 
 export function isElementRef(target: string): boolean {
@@ -485,88 +554,300 @@ export async function navigateTab(tabId: string, tabState: TabState, params: { u
 	});
 }
 
-export async function snapshotTab(tabState: TabState): Promise<{ url: string; snapshot: string; refsCount: number }>{
-	const ariaYaml = await getAriaSnapshot(tabState.page);
+export interface SnapshotTabOptions extends AriaSnapshotOptions {
+	currentTask?: string;
+	lastAction?: string;
+	/** Mark lines that did not exist in the previous snapshot with `*`. Default: true. */
+	diff?: boolean;
+}
+
+function applyDiffMarkers(
+	annotatedYaml: string,
+	previous: string | null | undefined,
+): { yaml: string; newCount: number } {
+	if (!previous) return { yaml: annotatedYaml, newCount: 0 };
+	const prevSet = new Set(previous.split('\n').map((l) => l.trim()).filter(Boolean));
+	let newCount = 0;
+	const lines = annotatedYaml.split('\n').map((line) => {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith('#')) return line;
+		if (!trimmed.startsWith('-')) return line;
+		if (prevSet.has(trimmed)) return line;
+		newCount++;
+		const indentMatch = line.match(/^(\s*)/);
+		const indent = indentMatch ? indentMatch[1] : '';
+		return `${indent}* ${line.trimStart()}`;
+	});
+	return { yaml: lines.join('\n'), newCount };
+}
+
+export async function snapshotTab(
+	tabState: TabState,
+	options: SnapshotTabOptions = {},
+): Promise<{ url: string; snapshot: string; refsCount: number; scoped?: boolean; newElementsCount?: number }> {
+	const { currentTask, lastAction, diff = true, ...ariaOpts } = options;
+	const ariaYaml = await getAriaSnapshot(tabState.page, ariaOpts);
 	tabState.refs = buildRefsFromAriaSnapshot(ariaYaml);
-	const annotatedYaml = annotateAriaYamlWithRefs(ariaYaml, tabState.refs);
+	let annotatedYaml = annotateAriaYamlWithRefs(ariaYaml, tabState.refs);
+
+	let newElementsCount = 0;
+	if (diff && !ariaOpts.focusSelector && !ariaOpts.rolesFilter?.length) {
+		// Only diff full-body snapshots to avoid spurious markers on scoped views.
+		const result = applyDiffMarkers(annotatedYaml, tabState.lastSnapshot);
+		annotatedYaml = result.yaml;
+		newElementsCount = result.newCount;
+		// Save un-marked baseline for next diff.
+		tabState.lastSnapshot = annotateAriaYamlWithRefs(ariaYaml, tabState.refs);
+	}
+
+	if (currentTask || lastAction) {
+		const banner: string[] = [];
+		if (currentTask) banner.push(`# task: ${currentTask.replace(/\n/g, ' ').slice(0, 200)}`);
+		if (lastAction) banner.push(`# last_action: ${lastAction.replace(/\n/g, ' ').slice(0, 200)}`);
+		if (newElementsCount > 0) banner.push(`# new_elements: ${newElementsCount} (marked with *)`);
+		annotatedYaml = `${banner.join('\n')}\n${annotatedYaml}`;
+	} else if (newElementsCount > 0) {
+		annotatedYaml = `# new_elements: ${newElementsCount} (marked with *)\n${annotatedYaml}`;
+	}
+
 	return {
 		url: tabState.page.url(),
 		snapshot: annotatedYaml,
 		refsCount: tabState.refs.size,
+		scoped: Boolean(ariaOpts.focusSelector || ariaOpts.rolesFilter?.length || ariaOpts.maxLines),
+		newElementsCount: newElementsCount > 0 ? newElementsCount : undefined,
 	};
 }
 
-export async function clickTab(tabId: string, tabState: TabState, params: { ref?: string; selector?: string }): Promise<{ ok: true; url: string }>{
-	const { ref, selector } = params;
+export async function snapshotTabDialog(
+	tabState: TabState,
+): Promise<{ url: string; snapshot: string; refsCount: number; selector: string } | null> {
+	const found = await getDialogAriaSnapshot(tabState.page);
+	if (!found) return null;
+	tabState.refs = buildRefsFromAriaSnapshot(found.snapshot);
+	const annotatedYaml = annotateAriaYamlWithRefs(found.snapshot, tabState.refs);
+	return {
+		url: tabState.page.url(),
+		snapshot: annotatedYaml,
+		refsCount: tabState.refs.size,
+		selector: found.selector,
+	};
+}
+
+export type ClickStrategy = 'locator' | 'force' | 'mouse' | 'jsdispatch' | 'keyboard-space';
+
+export interface ClickOptions {
+	ref?: string;
+	selector?: string;
+	/** Per-strategy Playwright timeout in ms. Range 1000-30000, default 5000. */
+	timeout?: number;
+	/** Skip plain locator click and start at force/mouse fallback chain. */
+	force?: boolean;
+	/** After click, verify a state change (aria-checked, data-state, input value, URL). */
+	verify?: boolean;
+}
+
+export interface ClickResult {
+	ok: true;
+	url: string;
+	strategy: ClickStrategy;
+	attempts: number;
+	verifiedStateChange?: boolean;
+	/** Pre/post snapshots used for verification (debugging aid). */
+	verifyDetails?: { before?: Record<string, string | null>; after?: Record<string, string | null> };
+}
+
+const DEFAULT_CLICK_TIMEOUT_MS = 5000;
+const MIN_CLICK_TIMEOUT_MS = 1000;
+const MAX_CLICK_TIMEOUT_MS = 30000;
+const RETRY_BACKOFF_MS = [0, 300, 1000] as const;
+
+export async function clickTab(tabId: string, tabState: TabState, params: ClickOptions): Promise<ClickResult> {
+	const { ref, selector, force = false, verify = false } = params;
 	if (!ref && !selector) {
 		const err = new Error('ref or selector required');
 		(err as Error & { statusCode?: number }).statusCode = 400;
 		throw err;
 	}
 
+	const timeout = Math.min(
+		MAX_CLICK_TIMEOUT_MS,
+		Math.max(MIN_CLICK_TIMEOUT_MS, params.timeout ?? DEFAULT_CLICK_TIMEOUT_MS),
+	);
+
 	return withTabLock(tabId, async () => {
+		const page = tabState.page;
+
+		// Capture verify state (best-effort; failures are non-fatal for click itself)
+		const captureVerifyState = async (locator: Locator): Promise<Record<string, string | null>> => {
+			try {
+				return await locator.evaluate((el) => {
+					const e = el as { getAttribute?: (k: string) => string | null; value?: string; checked?: boolean };
+					return {
+						ariaChecked: e.getAttribute?.('aria-checked') ?? null,
+						ariaPressed: e.getAttribute?.('aria-pressed') ?? null,
+						ariaExpanded: e.getAttribute?.('aria-expanded') ?? null,
+						dataState: e.getAttribute?.('data-state') ?? null,
+						value: typeof e.value === 'string' ? e.value : null,
+						checked: typeof e.checked === 'boolean' ? String(e.checked) : null,
+					};
+				});
+			} catch {
+				return {};
+			}
+		};
+
 		const dispatchMouseSequence = async (locator: Locator): Promise<void> => {
 			const box = await locator.boundingBox();
 			if (!box) throw new Error('Element not visible (no bounding box)');
-
 			const x = box.x + box.width / 2;
 			const y = box.y + box.height / 2;
-
-			await tabState.page.mouse.move(x, y);
-			await tabState.page.waitForTimeout(50);
-
-			await tabState.page.mouse.down();
-			await tabState.page.waitForTimeout(50);
-			await tabState.page.mouse.up();
-
+			await page.mouse.move(x, y);
+			await page.waitForTimeout(50);
+			await page.mouse.down();
+			await page.waitForTimeout(50);
+			await page.mouse.up();
 			log('info', 'mouse sequence dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
 		};
 
-		const doClick = async (locatorOrSelector: Locator | string, isLocator: boolean): Promise<void> => {
-			const locator = isLocator ? (locatorOrSelector as Locator) : tabState.page.locator(locatorOrSelector as string);
+		// JS dispatchEvent fallback (the manual workaround that consistently worked
+		// against Radix UI dialog buttons / autocomplete options where Playwright's
+		// locator.click times out despite the element being visible/enabled).
+		const dispatchJsClick = async (locator: Locator): Promise<void> => {
+			await locator.evaluate((el) => {
+				const browserGlobal = globalThis as { MouseEvent?: { new(type: string, init?: { bubbles?: boolean; cancelable?: boolean }): unknown } };
+				const MouseEventCtor = browserGlobal.MouseEvent;
+				if (typeof MouseEventCtor !== 'function') return;
+				const target = el as { dispatchEvent: (ev: unknown) => boolean };
+				const opts = { bubbles: true, cancelable: true };
+				target.dispatchEvent(new MouseEventCtor('mousedown', opts));
+				target.dispatchEvent(new MouseEventCtor('mouseup', opts));
+				target.dispatchEvent(new MouseEventCtor('click', opts));
+			});
+		};
 
-			try {
-				await locator.click({ timeout: 5000 });
-			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
-				if (message.includes('intercepts pointer events')) {
-					log('warn', 'click intercepted, retrying with force');
-					try {
-						await locator.click({ timeout: 5000, force: true });
-					} catch {
-						log('warn', 'force click failed, trying mouse sequence');
-						await dispatchMouseSequence(locator);
-					}
-				} else if (message.includes('not visible') || message.includes('timeout')) {
-					log('warn', 'click timeout, trying mouse sequence');
+		// Radix UI custom checkboxes: button[role=checkbox] with data-state="checked|unchecked".
+		// Playwright's click occasionally fails to flip aria-checked. Pressing Space on
+		// the focused element reliably toggles the controlled state.
+		const keyboardSpace = async (locator: Locator): Promise<void> => {
+			await locator.focus();
+			await page.keyboard.press('Space');
+		};
+
+		const tryStrategy = async (locator: Locator, strategy: ClickStrategy): Promise<void> => {
+			switch (strategy) {
+				case 'locator':
+					await locator.click({ timeout });
+					return;
+				case 'force':
+					await locator.click({ timeout, force: true });
+					return;
+				case 'mouse':
 					await dispatchMouseSequence(locator);
-				} else {
-					throw err;
-				}
+					return;
+				case 'jsdispatch':
+					await dispatchJsClick(locator);
+					return;
+				case 'keyboard-space':
+					await keyboardSpace(locator);
+					return;
 			}
 		};
 
-		if (ref) {
-			const locator = await refToLocator(tabState.page, ref, tabState.refs);
-			if (!locator) {
-				const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
-				const err = new Error(
-					`Unknown ref: ${ref} (valid refs: e1-${maxRef}, ${tabState.refs.size} total). Refs reset after navigation - call snapshot first.`,
-				);
-				(err as any).statusCode = 400;
-				throw err;
-			}
-			await doClick(locator, true);
-		} else {
-			await doClick(selector as string, false);
+		const buildLocator = (): Locator | Promise<Locator | null> => {
+			if (ref) return refToLocator(page, ref, tabState.refs);
+			return Promise.resolve(page.locator(selector as string));
+		};
+
+		const initialLocator = await buildLocator();
+		if (!initialLocator) {
+			const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
+			const err = new Error(
+				`Unknown ref: ${ref} (valid refs: e1-${maxRef}, ${tabState.refs.size} total). Refs reset after navigation - call snapshot first.`,
+			);
+			(err as Error & { statusCode?: number }).statusCode = 400;
+			throw err;
 		}
 
-		await tabState.page.waitForTimeout(500);
-		tabState.refs = await buildRefs(tabState.page);
+		// Build the strategy ladder. If `force=true` we skip the plain locator click.
+		const strategyOrder: ClickStrategy[] = force
+			? ['force', 'mouse', 'jsdispatch']
+			: ['locator', 'force', 'mouse', 'jsdispatch'];
 
-		const newUrl = tabState.page.url();
+		// Auto-detect Radix-style controlled checkbox / switch and add keyboard-space last.
+		try {
+			const isControlledToggle = await initialLocator.evaluate((el) => {
+				const e = el as { getAttribute?: (k: string) => string | null };
+				const role = e.getAttribute?.('role');
+				const dataState = e.getAttribute?.('data-state');
+				return (role === 'checkbox' || role === 'switch') && (dataState === 'checked' || dataState === 'unchecked');
+			}).catch(() => false);
+			if (isControlledToggle) strategyOrder.push('keyboard-space');
+		} catch {
+			/* non-fatal */
+		}
+
+		const before = verify ? await captureVerifyState(initialLocator) : undefined;
+		const beforeUrl = page.url();
+
+		let lastErr: unknown;
+		let chosenStrategy: ClickStrategy = strategyOrder[0];
+		let attempts = 0;
+
+		outer: for (let attempt = 0; attempt < RETRY_BACKOFF_MS.length; attempt++) {
+			if (RETRY_BACKOFF_MS[attempt] > 0) {
+				await page.waitForTimeout(RETRY_BACKOFF_MS[attempt]);
+			}
+			// On retries, refresh the locator (refs may be stale after partial DOM updates).
+			const locator = attempt === 0 ? initialLocator : (await buildLocator()) ?? initialLocator;
+
+			for (const strategy of strategyOrder) {
+				attempts++;
+				try {
+					await tryStrategy(locator, strategy);
+					chosenStrategy = strategy;
+					lastErr = undefined;
+					break outer;
+				} catch (err) {
+					lastErr = err;
+					const message = err instanceof Error ? err.message : String(err);
+					log('warn', 'click strategy failed', { strategy, attempt, message: message.slice(0, 200) });
+					// Hard errors that no fallback can fix → abort.
+					if (/closed|navigation|context destroyed|browser has been closed/i.test(message)) {
+						throw err;
+					}
+				}
+			}
+		}
+
+		if (lastErr) {
+			throw lastErr;
+		}
+
+		await page.waitForTimeout(500);
+		tabState.refs = await buildRefs(page);
+
+		let verifiedStateChange: boolean | undefined;
+		let verifyDetails: ClickResult['verifyDetails'];
+		if (verify && before) {
+			const newLocator = (await buildLocator()) ?? null;
+			const after = newLocator ? await captureVerifyState(newLocator) : {};
+			verifyDetails = { before, after };
+			const urlChanged = page.url() !== beforeUrl;
+			const stateChanged = Object.keys(before).some((k) => before[k] !== after[k]);
+			verifiedStateChange = urlChanged || stateChanged;
+		}
+
+		const newUrl = page.url();
 		tabState.visitedUrls.add(newUrl);
-		return { ok: true as const, url: newUrl };
+		return {
+			ok: true as const,
+			url: newUrl,
+			strategy: chosenStrategy,
+			attempts,
+			...(verifiedStateChange !== undefined ? { verifiedStateChange } : {}),
+			...(verifyDetails ? { verifyDetails } : {}),
+		};
 	});
 }
 
@@ -948,9 +1229,30 @@ export async function getLinks(
 	};
 }
 
-export async function screenshotTab(tabState: TabState, fullPage: boolean): Promise<Buffer> {
-	const buffer = await tabState.page.screenshot({ type: 'png', fullPage });
-	return buffer as Buffer;
+export interface ScreenshotOptions {
+	fullPage?: boolean;
+	/** Restrict capture to a region; reduces vision token cost. */
+	clip?: { x: number; y: number; width: number; height: number };
+	/** 'png' (default) or 'jpeg'. JPEG enables `quality` and shrinks payload. */
+	type?: 'png' | 'jpeg';
+	/** JPEG quality 1-100 (only when type='jpeg'). */
+	quality?: number;
+}
+
+export async function screenshotTab(tabState: TabState, options: ScreenshotOptions | boolean = {}): Promise<{ buffer: Buffer; mime: 'image/png' | 'image/jpeg' }> {
+	// Backward-compatible: caller passing a boolean = legacy fullPage flag.
+	const opts: ScreenshotOptions = typeof options === 'boolean' ? { fullPage: options } : options;
+	const type = opts.type ?? 'png';
+	const playwrightOpts: { type: 'png' | 'jpeg'; fullPage?: boolean; clip?: { x: number; y: number; width: number; height: number }; quality?: number } = {
+		type,
+		fullPage: opts.fullPage,
+	};
+	if (opts.clip) playwrightOpts.clip = opts.clip;
+	if (type === 'jpeg' && typeof opts.quality === 'number') {
+		playwrightOpts.quality = Math.max(1, Math.min(100, Math.round(opts.quality)));
+	}
+	const buffer = await tabState.page.screenshot(playwrightOpts);
+	return { buffer: buffer as Buffer, mime: type === 'jpeg' ? 'image/jpeg' : 'image/png' };
 }
 
 export async function waitTab(tabState: TabState, params: { timeout: number; waitForNetwork: boolean }): Promise<{ ok: true; ready: boolean }>{

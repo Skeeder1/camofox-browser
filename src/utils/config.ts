@@ -1,8 +1,8 @@
 /**
  * Centralized environment configuration for camofox-browser.
  *
- * All process.env access is isolated here so the scanner doesn't
- * flag plugin.ts or server.js for env-harvesting (env + network in same file).
+ * All process.env access is isolated here so scanners do not flag
+ * request-handling files for env-harvesting (env + network in the same file).
  */
 
 import { join } from 'node:path';
@@ -42,6 +42,7 @@ export interface ServerEnv {
   CAMOFOX_HEADLESS?: string;
   CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_MAX?: string;
   CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_WINDOW_MS?: string;
+  CAMOFOX_IDLE_TIMEOUT_MS?: string;
   PROXY_HOST?: string;
   PROXY_PORT?: string;
   PROXY_USERNAME?: string;
@@ -75,6 +76,7 @@ export interface AppConfig {
   headless: boolean | 'virtual';
   evalExtendedRateLimitMax: number;
   evalExtendedRateLimitWindowMs: number;
+  idleTimeoutMs: number;
   proxy: ProxyConfig;
   serverEnv: ServerEnv;
 }
@@ -107,6 +109,7 @@ export interface ConfigEnv extends NodeJS.ProcessEnv {
   CAMOFOX_HEADLESS?: string;
   CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_MAX?: string;
   CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_WINDOW_MS?: string;
+  CAMOFOX_IDLE_TIMEOUT_MS?: string;
   PROXY_HOST?: string;
   PROXY_PORT?: string;
   PROXY_USERNAME?: string;
@@ -180,6 +183,7 @@ export function loadConfig(env: ConfigEnv = process.env): AppConfig {
   const maxBatchConcurrency = parsePositiveIntOrDefault(env.CAMOFOX_MAX_BATCH_CONCURRENCY, 5);
   const maxBlobSizeMb = parsePositiveIntOrDefault(env.CAMOFOX_MAX_BLOB_SIZE_MB, 5);
   const maxDownloadsPerUser = parsePositiveIntOrDefault(env.CAMOFOX_MAX_DOWNLOADS_PER_USER, 500);
+  const idleTimeoutMs = parsePositiveIntOrDefault(env.CAMOFOX_IDLE_TIMEOUT_MS, 15 * 60 * 1000);
 
   return {
     port,
@@ -208,6 +212,7 @@ export function loadConfig(env: ConfigEnv = process.env): AppConfig {
     headless,
     evalExtendedRateLimitMax,
     evalExtendedRateLimitWindowMs,
+    idleTimeoutMs,
     proxy: {
       host: env.PROXY_HOST || '',
       port: env.PROXY_PORT || '',
@@ -241,6 +246,7 @@ export function loadConfig(env: ConfigEnv = process.env): AppConfig {
       CAMOFOX_HEADLESS: env.CAMOFOX_HEADLESS,
       CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_MAX: env.CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_MAX,
       CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_WINDOW_MS: env.CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_WINDOW_MS,
+      CAMOFOX_IDLE_TIMEOUT_MS: env.CAMOFOX_IDLE_TIMEOUT_MS,
       PROXY_HOST: env.PROXY_HOST,
       PROXY_PORT: env.PROXY_PORT,
       PROXY_USERNAME: env.PROXY_USERNAME,

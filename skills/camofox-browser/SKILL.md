@@ -9,7 +9,7 @@ allowed-tools: Bash(camofox:*)
 Camofox is an anti-detection browser automation system built on Camoufox + Playwright with:
 - CLI (`camofox`) for operator workflows
 - REST API (port `9377` by default) for programmatic control
-- OpenClaw plugin integration (`plugin.ts`) with 19 plugin tools
+- OpenClaw-compatible REST routes for agent frameworks
 
 This skill is optimized for bot-evasion workflows where default browser automation gets flagged.
 
@@ -18,7 +18,7 @@ This skill is optimized for bot-evasion workflows where default browser automati
 Use this skill instead of generic browser tooling when at least one applies:
 - You need anti-detection browser identity continuity across sessions.
 - You need proxy-aware geolocation behavior and region presets.
-- You need OpenClaw plugin compatibility with dedicated camofox tool names.
+- You need OpenClaw-compatible route shapes for agent integrations.
 - You need both CLI and REST API control paths against the same runtime.
 
 Do **not** use this skill if you only need a simple local static page script and anti-detection is irrelevant.
@@ -188,7 +188,7 @@ POST   /act
 Full endpoint map (all 48): `references/api-endpoints.md`.
 
 Compatibility warning:
-- `plugin.ts` includes a tool targeting `/youtube/transcript`, but current server route registration does not expose this endpoint.
+- `/youtube/transcript` is not registered by the current server routes.
 
 ## 5) Common Patterns
 
@@ -406,7 +406,6 @@ screenshot --output login-result.png --user ops1
 
 - `references/cli-commands.md` — Full CLI command catalog and usage patterns.
 - `references/api-endpoints.md` — Complete REST API route map and request/response notes.
-- `references/openclaw-tools.md` — OpenClaw plugin tool list and route/tool mapping.
 - `references/anti-detection.md` — Camoufox anti-detection model, fingerprint continuity, and stealth guidance.
 - `references/authentication.md` — Auth Vault encryption model and credential workflows.
 - `references/session-management.md` — `userId` isolation, context lifecycle, and session continuity.
@@ -428,10 +427,8 @@ screenshot --output login-result.png --user ops1
 
 ## 14) Important Notes
 
-- Plugin system in this repository is **OpenClaw plugin tools**, not MCP tools.
+- OpenClaw support in this repository is exposed through compatibility routes, not MCP tools.
 - There is **no MCP server implementation** in this codebase.
-- OpenClaw plugin currently defines 19 tools in `plugin.ts`.
-- A plugin tool references `/youtube/transcript`, but this route is **not registered** in current server routes (`core.ts`, `openclaw.ts`). Treat it as unavailable endpoint.
 - CLI element refs are `eN` (for example `e1`, `e2`), not `@eN`.
 - Source of truth for development decisions: `AGENTS.md`.
 
@@ -548,9 +545,9 @@ API response handling:
 ### Appendix D — mismatch and compatibility guardrails
 
 Documented guardrails for this repository revision:
-- OpenClaw plugin tool system exists and is first-class.
+- OpenClaw compatibility is route-based in this codebase.
 - MCP server implementation does **not** exist in this codebase.
-- Plugin tool `camofox_youtube_transcript` references a route not currently registered in route files.
+- `/youtube/transcript` is not currently registered in route files.
 - CLI `download` remains placeholder/stub and should be treated as non-functional direct download command.
 
 ### Appendix E — minimum safe automation contract

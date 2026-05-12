@@ -533,7 +533,7 @@ Returns: `{"ok": true, "result": {...}, "resultType": "object", "truncated": fal
 
 ### OpenClaw Endpoints
 
-OpenClaw-compatible aliases (used by the OpenClaw plugin).
+OpenClaw-compatible aliases for agent integrations.
 
 | Method | Endpoint | Description | Required | Auth |
 |--------|----------|-------------|----------|------|
@@ -605,7 +605,7 @@ Custom presets: set `CAMOFOX_PRESETS_FILE=/path/to/presets.json` (JSON object; k
 | `CAMOFOX_VNC_TIMEOUT_MS` | `120000` | Max VNC session duration in ms before auto-stop |
 | `CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_MAX` | `20` | Max evaluate-extended requests per user per window |
 | `CAMOFOX_EVAL_EXTENDED_RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window duration in ms |
-| `CAMOFOX_COOKIES_DIR` | `~/.camofox/cookies` | Directory used by the OpenClaw plugin cookie tool |
+| `CAMOFOX_COOKIES_DIR` | `~/.camofox/cookies` | Directory used for Netscape cookie imports |
 | `CAMOFOX_PROFILES_DIR` | `~/.camofox/profiles` | Profile storage directory (persistent per-user Firefox profiles) |
 | `CAMOFOX_DOWNLOADS_DIR` | `~/.camofox/downloads` | Download artifact directory |
 | `CAMOFOX_DOWNLOAD_TTL_MS` | `86400000` | Download metadata retention TTL |
@@ -747,4 +747,3 @@ This project is based on [camofox-browser](https://github.com/jo-inc/camofox-bro
 ## Crypto Scam Warning
 
 Sketchy people are doing sketchy things with crypto tokens named "Camofox" now that this project is getting attention. **Camofox is not a crypto project and will never be one.** Any token, coin, or NFT using the Camofox name has nothing to do with us.
-

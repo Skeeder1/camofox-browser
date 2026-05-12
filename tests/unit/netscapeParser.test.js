@@ -1,9 +1,8 @@
 /**
  * Tests for parseNetscapeCookieFile (Netscape cookie format parser)
  * 
- * The parser lives in plugin.ts. Since it's TypeScript and not directly
- * importable, we reimplement the same logic here for testing. Any change
- * to the parser in plugin.ts MUST be mirrored here.
+ * The parser lives in src/utils/cookies.ts. Since Jest runs these JavaScript
+ * tests without TypeScript transforms, keep this copy aligned with that parser.
  */
 
 function parseNetscapeCookieFile(text) {

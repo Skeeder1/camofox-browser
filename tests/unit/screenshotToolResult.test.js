@@ -1,11 +1,11 @@
 const http = require('http');
 
 /**
- * Unit tests for the plugin's camofox_screenshot tool result format.
+ * Unit tests for the legacy OpenClaw screenshot tool result format.
  *
  * These tests spin up a tiny mock server that returns PNG binary (like the real
  * server's GET /tabs/:tabId/screenshot endpoint), then exercise both the OLD
- * (broken) and NEW (fixed) fetch-and-return logic from plugin.ts.
+ * (broken) and NEW (fixed) fetch-and-return logic from the old plugin path.
  *
  * This proves:
  *   1. fetchApi() + toToolResult() fails on binary PNG (the bug).
@@ -51,7 +51,7 @@ afterAll(async () => {
 });
 
 describe('OLD plugin screenshot logic (broken)', () => {
-  // Reproduces the exact code path from the old plugin.ts:
+  // Reproduces the exact code path from the old plugin implementation:
   //   const result = await fetchApi(baseUrl, `/tabs/${tabId}/screenshot?userId=${userId}`);
   //   return toToolResult(result);
 
@@ -94,7 +94,7 @@ describe('OLD plugin screenshot logic (broken)', () => {
 });
 
 describe('NEW plugin screenshot logic (fixed)', () => {
-  // Reproduces the fixed code path from plugin.ts
+  // Reproduces the fixed screenshot tool code path.
 
   async function screenshotExecute(baseUrl, tabId, userId) {
     const url = `${baseUrl}/tabs/${tabId}/screenshot?userId=${userId}`;

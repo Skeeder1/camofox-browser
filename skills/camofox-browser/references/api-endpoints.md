@@ -7,7 +7,6 @@ Complete route reference from:
 Related:
 - `../SKILL.md`
 - `./cli-commands.md`
-- `./openclaw-tools.md`
 
 Source of truth for development: `AGENTS.md`
 
@@ -290,7 +289,7 @@ Action-specific fields:
 - Extended evaluate can return `429` (rate limit) and `408` (timeout).
 
 Important mismatch note:
-- `plugin.ts` registers a tool calling `POST /youtube/transcript`, but this route is **not registered** in `core.ts` or `openclaw.ts`.
+- `POST /youtube/transcript` is **not registered** in `core.ts` or `openclaw.ts`.
 - Do not treat YouTube transcript as an available endpoint in current server routes.
 
 ---
