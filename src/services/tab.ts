@@ -303,13 +303,13 @@ export async function dismissConsentDialogs(page: Page): Promise<void> {
 	}
 }
 
-export async function buildRefs(page: Page): Promise<Map<string, RefInfo>> {
+export async function buildRefs(page: Page, snapshotTimeout?: number): Promise<Map<string, RefInfo>> {
 	if (!page || page.isClosed()) {
 		log('warn', 'buildRefs: page closed or invalid');
 		return new Map<string, RefInfo>();
 	}
 
-	const ariaYaml = await getAriaSnapshot(page);
+	const ariaYaml = await getAriaSnapshot(page, snapshotTimeout !== undefined ? { snapshotTimeout } : {});
 	if (!ariaYaml) {
 		log('warn', 'buildRefs: no aria snapshot');
 		return new Map<string, RefInfo>();
@@ -358,20 +358,24 @@ export interface AriaSnapshotOptions {
 	maxLines?: number;
 	/** Restrict YAML to nodes whose role matches one of these (parents preserved). */
 	rolesFilter?: string[];
+	/** Timeout for ariaSnapshot call in ms. Defaults to 10000. Use low values (e.g. 100) for post-click best-effort snapshots. */
+	snapshotTimeout?: number;
 }
 
 export async function getAriaSnapshot(page: Page, options: AriaSnapshotOptions = {}): Promise<string | null> {
 	if (!page || page.isClosed()) return null;
 	await waitForPageReady(page, { waitForNetwork: false });
 	const target = options.focusSelector ? page.locator(options.focusSelector).first() : page.locator('body');
+	const snapTimeout = options.snapshotTimeout ?? 10000;
 	let raw: string;
 	try {
-		raw = await target.ariaSnapshot({ timeout: 10000 });
+		raw = await target.ariaSnapshot({ timeout: snapTimeout });
 	} catch {
+		if (snapTimeout < 1000) return null; // best-effort short timeout, don't retry
 		log('warn', 'ariaSnapshot failed, retrying');
 		await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
 		try {
-			raw = await target.ariaSnapshot({ timeout: 10000 });
+			raw = await target.ariaSnapshot({ timeout: snapTimeout });
 		} catch {
 			return null;
 		}
@@ -657,7 +661,7 @@ export interface ClickResult {
 	verifyDetails?: { before?: Record<string, string | null>; after?: Record<string, string | null> };
 }
 
-const DEFAULT_CLICK_TIMEOUT_MS = 5000;
+const DEFAULT_CLICK_TIMEOUT_MS = 20000;
 const MIN_CLICK_TIMEOUT_MS = 1000;
 const MAX_CLICK_TIMEOUT_MS = 30000;
 const RETRY_BACKOFF_MS = [0, 300, 1000] as const;
@@ -793,15 +797,33 @@ export async function clickTab(tabId: string, tabState: TabState, params: ClickO
 		let lastErr: unknown;
 		let chosenStrategy: ClickStrategy = strategyOrder[0];
 		let attempts = 0;
+		// Strategies that proved useless this click (e.g. force after locator already timed out).
+		const skippedStrategies = new Set<ClickStrategy>();
 
 		outer: for (let attempt = 0; attempt < RETRY_BACKOFF_MS.length; attempt++) {
 			if (RETRY_BACKOFF_MS[attempt] > 0) {
+				// If the URL already changed while we were waiting to retry, the click
+				// already had its intended effect — don't fire a second time.
+				if (page.url() !== beforeUrl) {
+					chosenStrategy = strategyOrder[0];
+					lastErr = undefined;
+					log('info', 'click: URL changed before retry, treating as success');
+					break outer;
+				}
 				await page.waitForTimeout(RETRY_BACKOFF_MS[attempt]);
+				// Check again after the wait.
+				if (page.url() !== beforeUrl) {
+					chosenStrategy = strategyOrder[0];
+					lastErr = undefined;
+					log('info', 'click: URL changed during backoff, treating as success');
+					break outer;
+				}
 			}
 			// On retries, refresh the locator (refs may be stale after partial DOM updates).
 			const locator = attempt === 0 ? initialLocator : (await buildLocator()) ?? initialLocator;
 
 			for (const strategy of strategyOrder) {
+				if (skippedStrategies.has(strategy)) continue;
 				attempts++;
 				try {
 					await tryStrategy(locator, strategy);
@@ -816,6 +838,11 @@ export async function clickTab(tabId: string, tabState: TabState, params: ClickO
 					if (/closed|navigation|context destroyed|browser has been closed/i.test(message)) {
 						throw err;
 					}
+					// locator timed out → force uses the same Playwright locator path and will
+					// also time out. Skip it to go straight to mouse.
+					if (strategy === 'locator' && /timeout/i.test(message)) {
+						skippedStrategies.add('force');
+					}
 				}
 			}
 		}
@@ -824,8 +851,15 @@ export async function clickTab(tabId: string, tabState: TabState, params: ClickO
 			throw lastErr;
 		}
 
-		await page.waitForTimeout(500);
-		tabState.refs = await buildRefs(page);
+		await page.waitForTimeout(1000);
+		// Best-effort 100ms snapshot; if the DOM hasn't settled yet (< 5 refs), wait
+		// another 500ms and do a proper 2s snapshot.
+		let postClickRefs = await buildRefs(page, 100);
+		if (postClickRefs.size < 5) {
+			await page.waitForTimeout(500);
+			postClickRefs = await buildRefs(page, 2000);
+		}
+		tabState.refs = postClickRefs;
 
 		let verifiedStateChange: boolean | undefined;
 		let verifyDetails: ClickResult['verifyDetails'];

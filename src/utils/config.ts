@@ -159,7 +159,7 @@ export function loadConfig(env: ConfigEnv = process.env): AppConfig {
   mkdirSync(profilesDir, { recursive: true });
   mkdirSync(downloadsDir, { recursive: true });
 
-  const handlerTimeoutMs = parsePositiveIntOrDefault(env.HANDLER_TIMEOUT_MS, 30000);
+  const handlerTimeoutMs = parsePositiveIntOrDefault(env.HANDLER_TIMEOUT_MS, 60000);
   const maxConcurrentPerUser = parsePositiveIntOrDefault(env.MAX_CONCURRENT_PER_USER, 3);
   const maxSnapshotChars = parsePositiveIntOrDefault(env.CAMOFOX_MAX_SNAPSHOT_CHARS, 80000);
   const snapshotTailChars = parsePositiveIntOrDefault(env.CAMOFOX_SNAPSHOT_TAIL_CHARS, 5000);
