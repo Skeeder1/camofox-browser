@@ -26,7 +26,11 @@ import { stopAllVnc } from './services/vnc';
 const CONFIG = loadConfig();
 
 const app = express();
-app.use(express.json({ limit: '100kb' }));
+// 5mb: profile save/load payloads (cookie-jar JSON) can exceed 100kb once a
+// session accumulates third-party/tracking cookies (e.g. 174KB observed for a
+// long-lived LeBonCoin session) — the old 100kb limit made load_profile fail
+// with "request entity too large" and forced a fallback to a stale profile.
+app.use(express.json({ limit: '5mb' }));
 app.use(loggingMiddleware);
 
 // Track last activity time for idle shutdown (updated on every non-health request)
