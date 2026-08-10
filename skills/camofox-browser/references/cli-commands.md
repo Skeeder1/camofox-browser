@@ -558,17 +558,13 @@ This table lists all 50 commands in one place.
 
 ## 15) Fallback/Compatibility Notes
 
-Several commands attempt API v2-style paths first and fall back to legacy/OpenClaw-compatible paths if needed.
+The CLI communicates with the server using direct route paths:
+- `open` → `POST /tabs`
+- `navigate` → `POST /navigate` (OpenClaw transport)
+- `snapshot` → `GET /snapshot` (OpenClaw transport)
+- `click`/`type`/`press` → `POST /tabs/:tabId/{action}`
 
-Examples:
-- `open`: tries `/api/create-tab`, falls back to `/tabs/open`
-- `navigate`: tries `/api/navigate`, falls back to `/navigate`
-- `snapshot`: tries `/api/snapshot-accessibility`, falls back to `/snapshot?...`
-- `click`/`type`/`press`: can fall back to `/tabs/:tabId/...` or `/act`
-
-What this means operationally:
-- CLI is resilient across mixed server compatibility surfaces.
-- If output shape differs between environments, use `--format json` and inspect keys rather than relying on free-form text.
+Legacy `/api/*` fallback paths were removed in v2. The CLI no longer attempts alternate URL patterns.
 
 Known command caveats:
 - `download` command is intentionally placeholder in current CLI implementation.

@@ -156,11 +156,7 @@ Closest API equivalents for auth-adjacent workflows:
 - Bearer required when `CAMOFOX_API_KEY` is set
 
 ### Optional route protections
-If `CAMOFOX_API_KEY` is configured, bearer auth required on:
-- `POST /sessions/:userId/cookies`
-- `GET /tabs/:tabId/cookies`
-- `POST /tabs/:tabId/evaluate`
-- `POST /tabs/:tabId/evaluate-extended`
+If `CAMOFOX_API_KEY` is configured, conditional bearer auth is enforced across all protected core and OpenClaw action/debug routes (33 total), including tab creation, navigation, interaction, session management, downloads, tracing, console, and errors. See `references/api-endpoints.md` for the per-endpoint auth matrix.
 
 OpenClaw admin protection:
 - `POST /stop` requires admin authorization based on `CAMOFOX_ADMIN_KEY`
@@ -260,7 +256,7 @@ camofox auth load account-a --inject --username-ref e4 --password-ref e7 --user 
 | `Invalid master password` | Wrong vault password or tampered payload | Re-enter password; verify file integrity |
 | `Profile '<name>' not found` | Missing `.enc` file | Run `camofox auth list` |
 | `Profile is corrupted` | Malformed encrypted file or invalid decrypted schema | Restore from backup / recreate profile |
-| `Forbidden` on cookie/eval endpoints | Missing/invalid bearer key while `CAMOFOX_API_KEY` is set | Send correct `Authorization` header |
+| `Forbidden` on protected endpoints | Missing/invalid bearer key while `CAMOFOX_API_KEY` is set | Send correct `Authorization` header |
 | `Forbidden` on `/stop` | Missing/invalid admin key | Send valid `x-admin-key` header |
 | Inject fails with ref errors | Stale or wrong refs | Run fresh `snapshot`, then inject with current refs |
 

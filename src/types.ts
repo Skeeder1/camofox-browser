@@ -1,4 +1,5 @@
 import type { BrowserContext, Page } from 'playwright-core';
+import type { ResolvedContextOptions } from './utils/presets';
 
 export interface GeolocationConfig {
   latitude: number;
@@ -175,7 +176,7 @@ export interface ExtractionMetadata {
 }
 
 export interface ExtractResourcesParams {
-  userId: string;
+  userId?: string;
   selector?: string;
   types?: ('images' | 'links' | 'media' | 'documents')[];
   extensions?: string[];
@@ -194,6 +195,50 @@ export interface ExtractResourcesResult {
   };
   totals: { images: number; links: number; media: number; documents: number; total: number };
   metadata: ExtractionMetadata;
+}
+
+export type StructuredScalarKind = 'text' | 'html' | 'attr' | 'url' | 'number';
+
+export interface StructuredExtractScalarSchema {
+  kind: StructuredScalarKind;
+  selector?: string;
+  required?: boolean;
+  trim?: boolean;
+  join?: string;
+  coerce?: 'number' | 'url';
+  attr?: string;
+}
+
+export interface StructuredExtractObjectSchema {
+  kind: 'object';
+  selector?: string;
+  required?: boolean;
+  fields: Record<string, StructuredExtractSchema>;
+}
+
+export interface StructuredExtractListSchema {
+  kind: 'list';
+  selector?: string;
+  required?: boolean;
+  item: StructuredExtractSchema;
+}
+
+export type StructuredExtractSchema =
+  | StructuredExtractScalarSchema
+  | StructuredExtractObjectSchema
+  | StructuredExtractListSchema;
+
+export type StructuredExtractRootSchema = StructuredExtractObjectSchema | StructuredExtractListSchema;
+
+export interface StructuredExtractMetadata {
+  extractionTimeMs: number;
+  matchedRoots?: number;
+}
+
+export interface StructuredExtractResult {
+  ok: true;
+  data: unknown;
+  metadata: StructuredExtractMetadata;
 }
 
 export interface BatchDownloadParams {
@@ -226,6 +271,48 @@ export interface YouTubeTranscriptResult {
   language?: string;
   total_words?: number;
   available_languages?: Array<{ code: string; name: string; kind: string }>;
+}
+
+export type GeoMode = 'explicit-wins' | 'proxy-locked';
+
+export interface RawProxyOverride {
+  host: string;
+  port: string;
+  username?: string;
+  password?: string;
+}
+
+export interface ProxyProfileConfig {
+  server: string;
+  username?: string;
+  password?: string;
+  locale?: string;
+  timezoneId?: string;
+  geolocation?: GeolocationConfig;
+}
+
+export interface SessionProfileInput extends ContextOverrides {
+  proxyProfile?: string;
+  proxy?: RawProxyOverride;
+  geoMode?: GeoMode;
+}
+
+export interface ResolvedProxyConfig {
+  source: 'server-default' | 'named-profile' | 'raw-override';
+  server: string;
+  username?: string;
+  password?: string;
+  profileName?: string;
+  locale?: string;
+  timezoneId?: string;
+  geolocation?: GeolocationConfig;
+}
+
+export interface ResolvedSessionProfile extends ResolvedContextOptions {
+  sessionKey: string;
+  geoMode: GeoMode;
+  proxy: ResolvedProxyConfig | null;
+  signature: string;
 }
 
 declare global {

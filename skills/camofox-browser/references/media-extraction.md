@@ -5,6 +5,7 @@ Source-verified reference for extraction and download tooling in camofox-browser
 Related:
 - `../SKILL.md`
 - `./api-endpoints.md`
+- `./openclaw-tools.md`
 
 Source of truth: `AGENTS.md`
 
@@ -57,12 +58,15 @@ When `yt-dlp` is unavailable or fails, browser mode can:
 
 ### Availability note (important)
 
-Server routes currently do **not** register a matching API endpoint:
+Public transcript surface is not exposed:
+- `camofox_youtube_transcript` has been removed from `plugin.ts` (route `POST /youtube/transcript` was never registered)
+
+But server routes currently do **not** register a matching API endpoint:
 - no `POST /youtube/transcript` route in `src/routes/core.ts`
 - no equivalent route in `src/routes/openclaw.ts`
 
 Result:
-- There is **no server API route** for transcript extraction at this time.
+- There is **no public plugin tool or server API route** for transcript extraction at this time.
 
 ---
 

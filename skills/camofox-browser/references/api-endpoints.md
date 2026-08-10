@@ -1,18 +1,34 @@
-# Camofox API Endpoints (48 Total)
+# Camofox API Endpoints (54 Core + OpenClaw Routes)
 
-Complete route reference from:
-- `src/routes/core.ts` (41 endpoints)
+Complete core + OpenClaw route reference from:
+- `src/routes/core.ts` (47 endpoints)
 - `src/routes/openclaw.ts` (7 endpoints)
 
 Related:
 - `../SKILL.md`
 - `./cli-commands.md`
+- `./openclaw-tools.md`
 
-Source of truth for development: `AGENTS.md`
+Source of truth for the 54-route catalog below: the live handlers in `src/routes/core.ts` and `src/routes/openclaw.ts`
+
+## OpenAPI Documentation
+
+The API is documented using OpenAPI 3.1.0 with interactive documentation:
+
+- **Interactive API Docs**: `GET /api/docs` — Swagger UI for exploring and testing API endpoints
+- **OpenAPI Spec**: `GET /openapi.json` — Machine-readable OpenAPI 3.1.0 specification
+
+The OpenAPI spec provides:
+- Request/response schemas with validation rules
+- Authentication requirements (bearer auth, admin key)
+- Representative coverage of core and OpenClaw endpoints
+- Live request testing via Swagger UI
+
+The docs routes live in `src/routes/docs.ts` and sit outside the 54-route catalog below. Use `/api/docs` when you need interactive API exploration or detailed request/response examples; use the catalog below when you need the full core + OpenClaw route inventory.
 
 ## Table of Contents
 
-1. Core Routes (`core.ts`) — 41
+1. Core Routes (`core.ts`) — 47
 2. OpenClaw Routes (`openclaw.ts`) — 7
 3. Endpoint Notes
 4. Auth & Security Notes
@@ -21,7 +37,7 @@ Source of truth for development: `AGENTS.md`
 
 ---
 
-## 1) Core Routes (`core.ts`) — 41
+## 1) Core Routes (`core.ts`) — 47
 
 Base URL: `http://localhost:9377`
 
@@ -36,8 +52,8 @@ Body:
 ```
 Response: `{ ok: true, userId, count }`
 Notes:
-- If `CAMOFOX_API_KEY` is set, requires bearer authorization
 - Validates array size and cookie shape
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 2. `GET /tabs/:tabId/cookies?userId=...`
 Export cookies from tab context.
@@ -70,6 +86,7 @@ Body:
 }
 ```
 Response: `{ tabId, url }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 6. `GET /tabs?userId=...`
 List tabs for user.
@@ -80,6 +97,7 @@ Response: `{ running: true, tabs: [...] }`
 ### 7. `POST /tabs/:tabId/navigate`
 Body: `{ userId, url }` or `{ userId, macro, query }`
 Response: `{ ok: true, url }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 8. `GET /tabs/:tabId/snapshot?userId=...`
 Accessibility snapshot.
@@ -87,19 +105,24 @@ Response includes snapshot text and refs metadata.
 
 ### 9. `POST /tabs/:tabId/wait`
 Body: `{ userId, timeout?, waitForNetwork? }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 10. `POST /tabs/:tabId/click`
 Body: `{ userId, ref? , selector? }`
 Response may include recent downloads metadata when click triggers download.
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 11. `POST /tabs/:tabId/type`
 Body: `{ userId, ref?, selector?, text }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 12. `POST /tabs/:tabId/press`
 Body: `{ userId, key }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 13. `POST /tabs/:tabId/scroll`
-Body: `{ userId, direction?: "up"|"down", amount?: number }`
+Body: `{ userId, direction?: "up"|"down"|"left"|"right", amount?: number }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 14. `POST /tabs/:tabId/scroll-element`
 Body:
@@ -113,6 +136,7 @@ Body:
   "scrollTo": {"top": 1200, "left": 0}
 }
 ```
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 15. `POST /tabs/:tabId/evaluate`
 Body: `{ userId, expression, timeout? }`
@@ -131,99 +155,155 @@ Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 17. `POST /tabs/:tabId/back`
 Body: `{ userId }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 18. `POST /tabs/:tabId/forward`
 Body: `{ userId }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ### 19. `POST /tabs/:tabId/refresh`
 Body: `{ userId }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ## Console & Error Capture
 
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/tabs/:tabId/console` | Get console messages. Query: `?userId=`, `?type=`, `?limit=` |
-| GET | `/tabs/:tabId/errors` | Get page errors. Query: `?userId=`, `?limit=` |
-| POST | `/tabs/:tabId/console/clear` | Clear console and error buffers. Body: `{ userId }` |
+### 20. `GET /tabs/:tabId/console`
+Query:
+- `userId` (required)
+- optional `type`, `limit`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 21. `GET /tabs/:tabId/errors`
+Query:
+- `userId` (required)
+- optional `limit`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 22. `POST /tabs/:tabId/console/clear`
+Body: `{ userId }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ## Tracing
 
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/tabs/:tabId/trace/start` | Start Playwright tracing. Body: `{ userId, screenshots?, snapshots? }` |
-| POST | `/tabs/:tabId/trace/stop` | Stop tracing and save ZIP. Body: `{ userId, path? }` |
-| POST | `/tabs/:tabId/trace/chunk/start` | Start trace chunk. Body: `{ userId }` |
-| POST | `/tabs/:tabId/trace/chunk/stop` | Stop trace chunk and save ZIP. Body: `{ userId, path? }` |
-| GET | `/tabs/:tabId/trace/status` | Get tracing status. Query: `?userId=` |
+### 23. `POST /tabs/:tabId/trace/start`
+Body: `{ userId, screenshots?, snapshots? }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 24. `POST /tabs/:tabId/trace/stop`
+Body: `{ userId, path? }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 25. `POST /tabs/:tabId/trace/chunk/start`
+Body: `{ userId }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 26. `POST /tabs/:tabId/trace/chunk/stop`
+Body: `{ userId, path? }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 27. `GET /tabs/:tabId/trace/status`
+Query: `userId`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 28. `GET /sessions/:userId/traces`
+Lists managed trace ZIPs for a user.
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 29. `GET /sessions/:userId/traces/:filename`
+Downloads a managed trace ZIP for a user.
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 30. `DELETE /sessions/:userId/traces/:filename`
+Deletes a managed trace ZIP for a user.
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ## Extraction and stats
 
-### 20. `GET /tabs/:tabId/links`
+### 31. `GET /tabs/:tabId/links`
 Query:
 - `userId` (required)
 - `limit`, `offset`
 - `scope`, `extension`, `downloadOnly`
 
-### 21. `GET /tabs/:tabId/screenshot`
+### 32. `GET /tabs/:tabId/screenshot`
 Query: `userId`, optional `fullPage=true`
 Returns PNG bytes.
 
-### 22. `GET /tabs/:tabId/stats`
+### 33. `GET /tabs/:tabId/images`
+Query:
+- `userId` (required)
+- optional `selector`, `extensions`, `resolveBlobs`, `triggerLazyLoad`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 34. `GET /tabs/:tabId/stats`
 Query: `userId`
 Response includes `visitedUrls`, `toolCalls`, `refsCount`.
 
 ## Tab/session deletion
 
-### 23. `DELETE /tabs/:tabId`
+### 35. `DELETE /tabs/:tabId`
 Body: `{ userId }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
-### 24. `DELETE /tabs/group/:listItemId`
+### 36. `DELETE /tabs/group/:listItemId`
 Body: `{ userId }`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
-### 25. `DELETE /sessions/:userId`
+### 37. `DELETE /sessions/:userId`
 Closes all sessions and cleans downloads for user.
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
-### 26. `POST /sessions/:userId/toggle-display`
+### 38. `POST /sessions/:userId/toggle-display`
 Body: `{ headless: true|false|"virtual" }`
 Notes:
 - Restarts user context
 - Existing tabs become invalid
 - Can return `vncUrl` in non-headless modes
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ## Download management
 
-### 27. `GET /tabs/:tabId/downloads`
+### 39. `GET /tabs/:tabId/downloads`
 Query:
 - `userId` (required)
 - optional filters: `status`, `extension`, `mimeType`, `minSize`, `maxSize`, `sort`, `limit`, `offset`
 
-### 28. `GET /users/:userId/downloads`
+### 40. `GET /users/:userId/downloads`
 Optional same filters as tab download listing.
 
-### 29. `GET /downloads/:downloadId`
+### 41. `GET /downloads/:downloadId`
 Query: `userId` (required)
 
-### 30. `GET /downloads/:downloadId/content`
+### 42. `GET /downloads/:downloadId/content`
 Query: `userId` (required)
 Streams file content if completed.
 
-### 31. `DELETE /downloads/:downloadId`
+### 43. `DELETE /downloads/:downloadId`
 `userId` accepted from body or query.
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ## Resource extraction/download helpers
 
-### 32. `POST /tabs/:tabId/extract-resources`
+### 44. `POST /tabs/:tabId/extract-resources`
 Body options include:
 - `userId` (required)
 - `selector`, `types`, `extensions`, `resolveBlobs`, `triggerLazyLoad`
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
-### 33. `POST /tabs/:tabId/batch-download`
+### 45. `POST /tabs/:tabId/extract-structured`
+Body options include:
+- `userId` (required)
+- `schema` (required structured extraction schema)
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 46. `POST /tabs/:tabId/batch-download`
 Body:
 - `userId` (required)
 - plus batch download options
 Timeout allows longer-running operations (up to 300s wrapper).
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
-### 34. `POST /tabs/:tabId/resolve-blobs`
+### 47. `POST /tabs/:tabId/resolve-blobs`
 Body:
 ```json
 { "userId": "agent1", "urls": ["blob:..."] }
@@ -238,10 +318,10 @@ Constraints:
 
 These are compatibility endpoints for OpenClaw clients.
 
-### 35. `GET /`
+### 48. `GET /`
 Status alias route.
 
-### 36. `POST /tabs/open`
+### 49. `POST /tabs/open`
 Open tab in OpenClaw body format.
 
 Body:
@@ -249,21 +329,30 @@ Body:
 { "userId": "agent1", "url": "https://example.com", "listItemId": "default" }
 ```
 
-### 37. `POST /start`
+Precondition: Requires an existing canonical profile for `userId` (returns `409` if absent — create one first via `POST /tabs`).
+Download listener: Attached before initial navigation, so downloads triggered on first load are captured.
+Auth: bearer required when `CAMOFOX_API_KEY` is set
+
+### 50. `POST /start`
 Compatibility start endpoint; returns profile status payload.
 
-### 38. `POST /stop`
+### 51. `POST /stop`
 Stop browser/session state.
 Auth:
 - Requires admin authorization (`CAMOFOX_ADMIN_KEY` semantics)
 
-### 39. `POST /navigate`
-Body: `{ targetId, url, userId }`
+### 52. `POST /navigate`
+Body: `{ targetId, url, userId }` or `{ targetId, macro, query, userId }`
 
-### 40. `GET /snapshot`
-Query: `targetId`, `userId`, optional `format`
+Supports search macros (e.g., `@google_search`) via `macro` + `query` fields, same as core `POST /tabs/:tabId/navigate`.
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
-### 41. `POST /act`
+### 53. `GET /snapshot`
+Query: `targetId`, `userId`, optional `format`, optional `offset`
+
+The `offset` query parameter controls character-level pagination of long snapshots. `offset=0` (default) returns the head chunk plus tail navigation links. `offset=N` returns characters N through N+budget. Non-finite or negative values are clamped to 0; values exceeding the snapshot length are clamped to the maximum valid offset. Response includes `nextOffset` when more content is available.
+
+### 54. `POST /act`
 Combined action endpoint.
 
 Body baseline:
@@ -278,6 +367,7 @@ Action-specific fields:
 - hover: `ref|selector`
 - wait: `timeMs?`, `text?`, `loadState?`
 - close: none additional
+Auth: bearer required when `CAMOFOX_API_KEY` is set
 
 ---
 
@@ -289,14 +379,14 @@ Action-specific fields:
 - Extended evaluate can return `429` (rate limit) and `408` (timeout).
 
 Important mismatch note:
-- `POST /youtube/transcript` is **not registered** in `core.ts` or `openclaw.ts`.
+- The `camofox_youtube_transcript` tool has been removed from `plugin.ts`. The route `POST /youtube/transcript` remains unregistered.
 - Do not treat YouTube transcript as an available endpoint in current server routes.
 
 ---
 
 ## 4) Auth & Security Notes
 
-- Bearer API key checks are conditional on `CAMOFOX_API_KEY` for sensitive endpoints (cookie import/export and evaluate family).
+- Bearer API key checks are conditional on `CAMOFOX_API_KEY` across protected core and OpenClaw action/debug routes; use the per-endpoint Auth notes above as the detailed matrix.
 - OpenClaw stop endpoint requires admin authorization.
 - Session display toggle invalidates existing tabs by restarting context.
 
@@ -327,7 +417,19 @@ Important mismatch note:
 | `POST /tabs/:tabId/back` | body |
 | `POST /tabs/:tabId/forward` | body |
 | `POST /tabs/:tabId/refresh` | body |
+| `GET /tabs/:tabId/console` | query |
+| `GET /tabs/:tabId/errors` | query |
+| `POST /tabs/:tabId/console/clear` | body |
+| `POST /tabs/:tabId/trace/start` | body |
+| `POST /tabs/:tabId/trace/stop` | body |
+| `POST /tabs/:tabId/trace/chunk/start` | body |
+| `POST /tabs/:tabId/trace/chunk/stop` | body |
+| `GET /tabs/:tabId/trace/status` | query |
+| `GET /sessions/:userId/traces` | path |
+| `GET /sessions/:userId/traces/:filename` | path |
+| `DELETE /sessions/:userId/traces/:filename` | path |
 | `GET /tabs/:tabId/links` | query |
+| `GET /tabs/:tabId/images` | query |
 | `GET /tabs/:tabId/screenshot` | query |
 | `GET /tabs/:tabId/stats` | query |
 | `DELETE /tabs/:tabId` | body |
@@ -340,6 +442,7 @@ Important mismatch note:
 | `GET /downloads/:downloadId/content` | query |
 | `DELETE /downloads/:downloadId` | body or query |
 | `POST /tabs/:tabId/extract-resources` | body |
+| `POST /tabs/:tabId/extract-structured` | body |
 | `POST /tabs/:tabId/batch-download` | body |
 | `POST /tabs/:tabId/resolve-blobs` | body |
 | `GET /` (OpenClaw) | none |

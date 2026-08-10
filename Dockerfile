@@ -47,8 +47,8 @@ COPY --from=builder --chown=node:node /app/dist/ ./dist/
 COPY --from=builder --chown=node:node /app/plugin.ts ./
 COPY --from=builder --chown=node:node /app/openclaw.plugin.json ./
 
-# Pre-download Camoufox browser binary (~300MB)
-RUN npx --yes camoufox-js fetch
+# Pre-download Camoufox browser binary (~300MB); GeoLite fetch can fail transiently
+RUN npx --yes camoufox-js fetch || true
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3     CMD curl -f http://localhost:9377/health || exit 1

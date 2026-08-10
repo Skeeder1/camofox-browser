@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 
 import express, { Router, type Request, type Response } from 'express';
 
@@ -11,23 +11,43 @@ import { checkRateLimit } from '../middleware/rate-limit';
 import { loadConfig } from '../utils/config';
 import { getAllPresets, resolveContextOptions, validateContextOptions } from '../utils/presets';
 import { contextPool, getDisplayForUser } from '../services/context-pool';
+import { lifecycleController } from '../services/lifecycle-controller';
 import { startVnc, stopVnc } from '../services/vnc';
 import {
 	MAX_TABS_PER_SESSION,
+	acquireFirstCreateMutex,
+	acquireSessionProfileCreateMutex,
+	claimDefaultSessionProfileRuntime,
+	clearSessionProfile,
+	clearDefaultSessionProfileClaim,
+	commitStagedFirstUse,
+	createCanonicalProfile,
+	createStagedSession,
+	establishSessionProfile,
 	findTabById,
+	getCanonicalProfile,
+	getEstablishedSessionProfile,
 	getSession,
 	getSessionMapKey,
+	getSessionProfileLaunchSettings,
 	getSessionsForUser,
 	getTabGroup,
+	hasDefaultSessionProfileRuntime,
 	indexTab,
 	normalizeUserId,
+	rollbackCanonicalMutex,
+	rollbackSessionProfileRuntime,
+	rollbackStagedFirstUse,
 	unindexTab,
+	waitForSessionProfileCreate,
 	closeSessionsForUser,
 	countTotalTabsForSessions,
 	withUserLimit,
 } from '../services/session';
 import {
+	acquirePageForNewTab,
 	backTab,
+	buildSnapshotPayload,
 	buildRefs,
 	clickTab,
 	createTabState,
@@ -38,19 +58,21 @@ import {
 	pressTab,
 	refreshTab,
 	screenshotTab,
+	scrollTab,
 	scrollElementTab,
 	snapshotTab,
-	snapshotTabDialog,
 	calculateTypeTimeoutMs,
+	navigateWithSafetyGuard,
 	typeTab,
 	safePageClose,
-	validateUrl,
+	validateNavigationUrl,
 	waitForPageReady,
 	withTimeout,
 	withTabLock,
 } from '../services/tab';
 
 import {
+	commitStagedDownloads,
 	registerDownloadListener,
 	listDownloads,
 	getDownload,
@@ -58,8 +80,14 @@ import {
 	deleteDownload,
 	getRecentDownloads,
 	cleanupUserDownloads,
+	markDownloadsStaged,
 } from '../services/download';
-import { extractResources, resolveBlob } from '../services/resource-extractor';
+import { extractImages, extractResources, resolveBlob } from '../services/resource-extractor';
+import {
+	StructuredExtractRuntimeError,
+	StructuredExtractSchemaError,
+	extractStructuredData,
+} from '../services/structured-extractor';
 import { batchDownload } from '../services/batch-downloader';
 import {
 	startTracing,
@@ -67,9 +95,12 @@ import {
 	startTracingChunk,
 	stopTracingChunk,
 	getTracingState,
+	listTraceArtifacts,
+	resolveTraceArtifactPath,
+	deleteTraceArtifact,
 } from '../services/tracing';
 
-import type { CookieInput, ContextOverrides, TabState } from '../types';
+import type { CookieInput, ContextOverrides, ResolvedSessionProfile, StructuredExtractRootSchema, TabState } from '../types';
 
 const CONFIG = loadConfig();
 const PKG_VERSION = (() => {
@@ -96,6 +127,25 @@ function getTracingErrorStatus(err: unknown): number {
 	if (message.includes('Tracing not started')) return 400;
 	if (message.includes('Chunk already active')) return 409;
 	if (message.includes('No active chunk')) return 400;
+	if (message.includes('Invalid trace output path')) return 400;
+	return 500;
+}
+
+function getTraceArtifactErrorStatus(err: unknown): number {
+	const message = err instanceof Error ? err.message : String(err);
+	if (message.includes('Invalid trace filename')) return 400;
+	if (message.includes('does not belong to this user')) return 404;
+	if (typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT') return 404;
+	return 500;
+}
+
+function getRouteErrorStatus(err: unknown): number {
+	if (typeof err === 'object' && err !== null && 'statusCode' in err && typeof err.statusCode === 'number') {
+		return err.statusCode;
+	}
+	if (typeof err === 'object' && err !== null && 'status' in err && typeof err.status === 'number') {
+		return err.status;
+	}
 	return 500;
 }
 
@@ -164,7 +214,33 @@ router.post(
 				if (!found) return res.status(404).json({ error: 'Tab not found' });
 				session = found.session;
 			} else {
-				session = await getSession(userId);
+				const canonical = getCanonicalProfile(userId);
+				if (!canonical) {
+					log('warn', 'cookie import rejected: no canonical profile', { userId: String(userId) });
+					return res.status(409).json({
+						error: 'No canonical profile',
+						message: 'Cannot import cookies without an established canonical profile. Create a tab via POST /tabs first.',
+					});
+				}
+				const existingSessions = getSessionsForUser(userId);
+				if (existingSessions.length === 0) {
+					log('warn', 'cookie import rejected: no active session', { userId: String(userId) });
+					return res.status(409).json({
+						error: 'No active session',
+						message: 'Cannot import cookies without an active session. Create a tab via POST /tabs first.',
+					});
+				}
+				if (existingSessions.length > 1) {
+					log('warn', 'cookie import rejected: ambiguous active sessions', {
+						userId: String(userId),
+						sessionCount: existingSessions.length,
+					});
+					return res.status(409).json({
+						error: 'Ambiguous active sessions',
+						message: 'Multiple active browser contexts exist for this user. Provide tabId to import cookies into a specific context.',
+					});
+				}
+				session = existingSessions[0][1];
 			}
 			await session.context.addCookies(sanitized as never);
 			const result = { ok: true, userId: String(userId), count: sanitized.length };
@@ -275,11 +351,60 @@ router.post(
 		>,
 		res: Response,
 	) => {
+		let createUserId: string | undefined;
+		let createSessionKey: string | undefined;
+		let createdSessionProfile = false;
+		let createdSessionProfileSignature: string | undefined;
+		let createdDefaultSessionProfileClaim = false;
+		let releaseSessionProfileCreate: ((committed: boolean) => void) | undefined;
+		let isFirstCreator = false;
+		let stagedGeneration: string | undefined;
 		try {
+			if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+				return res.status(403).json({ error: 'Forbidden' });
+			}
+
+			// Record activity at START to prevent idle cleanup race during tab creation
+			lifecycleController.recordInteractiveActivity();
+
 			const { userId, sessionKey, listItemId, url, preset, locale, timezoneId, geolocation, viewport } = req.body;
+			const { proxy, proxyProfile, geoMode } = req.body as {
+				proxy?: unknown;
+				proxyProfile?: string;
+				geoMode?: 'explicit-wins' | 'proxy-locked';
+			};
 			const resolvedSessionKey = sessionKey || listItemId;
 			if (!userId || !resolvedSessionKey) {
 				return res.status(400).json({ error: 'userId and sessionKey required' });
+			}
+			createUserId = String(userId);
+			createSessionKey = String(resolvedSessionKey);
+
+			// Check for session profile conflict (proxy/geo drift)
+			let resolvedSessionProfile: ResolvedSessionProfile | undefined;
+			if (proxy || proxyProfile || geoMode) {
+				const { resolveSessionProfileInput, getConfiguredServerProxy, loadProxyProfiles } = await import('../utils/proxy-profiles');
+				const profileInput = {
+					preset,
+					locale,
+					timezoneId,
+					geolocation: geolocation as any,
+					viewport: viewport as any,
+					proxy: proxy as any,
+					proxyProfile,
+					geoMode,
+				};
+				const deps = {
+					serverProxy: getConfiguredServerProxy(CONFIG.proxy),
+					proxyProfiles: loadProxyProfiles(CONFIG.proxyProfilesFile),
+				};
+				try {
+					const resolvedProfileBase = resolveSessionProfileInput(profileInput, deps);
+					resolvedSessionProfile = { ...resolvedProfileBase, sessionKey: resolvedSessionKey };
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					return res.status(400).json({ error: message });
+				}
 			}
 
 			let contextOverrides: ContextOverrides | null = null;
@@ -293,30 +418,176 @@ router.post(
 				const validationError = validateContextOptions(contextOverrides);
 				if (validationError) return res.status(400).json({ error: validationError });
 			}
-
-			const sessionMapKey = getSessionMapKey(userId, contextOverrides);
-			const session = await getSession(userId, contextOverrides);
-
-			const totalTabs = countTotalTabsForSessions([[sessionMapKey, session]]);
-			if (totalTabs >= MAX_TABS_PER_SESSION) {
-				return res.status(429).json({ error: 'Maximum tabs per session reached' });
+			if (url) {
+				const urlErr = await validateNavigationUrl(url, {
+					allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
+				});
+				if (urlErr) return res.status(400).json({ error: urlErr });
 			}
 
-			const group = getTabGroup(session, resolvedSessionKey);
-			const page = await session.context.newPage();
-			const tabId = crypto.randomUUID();
-			(page as unknown as { __camofox_tabId?: string }).__camofox_tabId = tabId;
-			const tabState = createTabState(page);
-			group.set(tabId, tabState);
-			indexTab(tabId, sessionMapKey);
+			const requestedProfile = createCanonicalProfile(contextOverrides);
+			const requestHash = requestedProfile.hash;
 
-			registerDownloadListener(tabId, String(userId), page);
+			const MAX_CANONICAL_RETRIES = 3;
+			for (let attempt = 0; attempt < MAX_CANONICAL_RETRIES; attempt++) {
+				const existingProfile = getCanonicalProfile(userId);
+				if (existingProfile) {
+					if (contextOverrides === null) {
+						contextOverrides = existingProfile.resolvedOverrides;
+					} else if (requestHash !== existingProfile.hash) {
+						log('warn', 'canonical profile conflict', { userId: String(userId) });
+						return res.status(409).json({
+							error: 'Context override conflict',
+							message: 'A canonical profile already exists for this user with different overrides. Close the session first to reconfigure.',
+						});
+					} else {
+						contextOverrides = existingProfile.resolvedOverrides;
+					}
+					break;
+				}
 
-			if (url) {
-				const urlErr = validateUrl(url);
-				if (urlErr) return res.status(400).json({ error: urlErr });
-				await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-				tabState.visitedUrls.add(url);
+				const mutex = acquireFirstCreateMutex(userId);
+				if (mutex.acquired) {
+					isFirstCreator = true;
+					break;
+				}
+
+				await mutex.wait;
+			}
+
+			if (!getCanonicalProfile(userId) && !isFirstCreator) {
+				log('error', 'canonical profile acquisition failed after retries', { userId: String(userId) });
+				return res.status(503).json({ error: 'Could not acquire canonical profile, try again' });
+			}
+
+			if (resolvedSessionProfile) {
+				while (true) {
+					await waitForSessionProfileCreate(userId, resolvedSessionKey);
+					const existingProfile = getEstablishedSessionProfile(userId, resolvedSessionKey);
+					if (existingProfile) {
+						if (existingProfile.signature !== resolvedSessionProfile.signature) {
+							return res.status(409).json({ error: 'Session profile conflict' });
+						}
+						break;
+					}
+					if (hasDefaultSessionProfileRuntime(userId, resolvedSessionKey)) {
+						return res.status(409).json({ error: 'Session profile conflict' });
+					}
+
+					const mutex = acquireSessionProfileCreateMutex(userId, resolvedSessionKey, resolvedSessionProfile.signature);
+					if (mutex.acquired) {
+						releaseSessionProfileCreate = mutex.release;
+						try {
+							establishSessionProfile(userId, resolvedSessionKey, resolvedSessionProfile);
+							createdSessionProfile = true;
+							createdSessionProfileSignature = resolvedSessionProfile.signature;
+						} catch (err) {
+							releaseSessionProfileCreate(false);
+							releaseSessionProfileCreate = undefined;
+							const message = err instanceof Error ? err.message : String(err);
+							if (message === 'Session profile conflict') {
+								return res.status(409).json({ error: 'Session profile conflict' });
+							}
+							return res.status(400).json({ error: message });
+						}
+						break;
+					}
+
+					await mutex.wait;
+				}
+			} else {
+				await waitForSessionProfileCreate(userId, resolvedSessionKey);
+				if (!getEstablishedSessionProfile(userId, resolvedSessionKey)) {
+					createdDefaultSessionProfileClaim = claimDefaultSessionProfileRuntime(userId, resolvedSessionKey);
+				}
+			}
+
+			const establishedProfile = getEstablishedSessionProfile(userId, resolvedSessionKey);
+			const sessionMapKey = establishedProfile
+				? getSessionMapKey(userId, resolvedSessionKey, establishedProfile.signature)
+				: getSessionMapKey(userId, contextOverrides);
+			let tabId: string;
+			let pageUrl: string;
+
+			if (isFirstCreator) {
+				const staged = await createStagedSession(userId, contextOverrides, resolvedSessionKey);
+				stagedGeneration = staged.generation;
+				const { session, generation } = staged;
+				const page = await acquirePageForNewTab(session.context);
+				tabId = crypto.randomUUID();
+				(page as unknown as { __camofox_tabId?: string }).__camofox_tabId = tabId;
+				const tabState = await createTabState(page);
+
+				registerDownloadListener(tabId, String(userId), page);
+				markDownloadsStaged(tabId);
+
+				if (url) {
+					await navigateWithSafetyGuard(page, url, {
+						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
+						waitUntil: 'domcontentloaded',
+						timeout: 30000,
+					});
+					tabState.visitedUrls.add(url);
+				}
+
+				const committed = commitStagedFirstUse(userId, session, contextOverrides, {
+					tabId,
+					sessionMapKey,
+					sessionKey: resolvedSessionKey,
+					tabState,
+				}, generation);
+				if (!committed) {
+					await rollbackStagedFirstUse(createUserId ?? userId, generation).catch(() => {});
+					if (createdSessionProfile && createdSessionProfileSignature) {
+						await rollbackSessionProfileRuntime(userId, resolvedSessionKey, createdSessionProfileSignature);
+					}
+					if (createdDefaultSessionProfileClaim) {
+						clearDefaultSessionProfileClaim(userId, resolvedSessionKey);
+						createdDefaultSessionProfileClaim = false;
+					}
+					releaseSessionProfileCreate?.(false);
+					releaseSessionProfileCreate = undefined;
+					return res.status(409).json({ error: 'Session closed during creation' });
+				}
+				commitStagedDownloads(tabId);
+
+				pageUrl = page.url();
+			} else {
+				const session = await getSession(userId, contextOverrides, resolvedSessionKey);
+				const totalTabs = countTotalTabsForSessions([[sessionMapKey, session]]);
+				if (totalTabs >= MAX_TABS_PER_SESSION) {
+					if (createdSessionProfile && createdSessionProfileSignature) {
+						await rollbackSessionProfileRuntime(userId, resolvedSessionKey, createdSessionProfileSignature);
+					}
+					if (createdDefaultSessionProfileClaim) {
+						clearDefaultSessionProfileClaim(userId, resolvedSessionKey);
+						createdDefaultSessionProfileClaim = false;
+					}
+					releaseSessionProfileCreate?.(false);
+					releaseSessionProfileCreate = undefined;
+					return res.status(429).json({ error: 'Maximum tabs per session reached' });
+				}
+
+				const group = getTabGroup(session, resolvedSessionKey);
+				const page = await acquirePageForNewTab(session.context);
+				tabId = crypto.randomUUID();
+				(page as unknown as { __camofox_tabId?: string }).__camofox_tabId = tabId;
+				const tabState = await createTabState(page);
+				group.set(tabId, tabState);
+				indexTab(tabId, sessionMapKey);
+
+				registerDownloadListener(tabId, String(userId), page);
+
+				if (url) {
+					await navigateWithSafetyGuard(page, url, {
+						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
+						waitUntil: 'domcontentloaded',
+						timeout: 30000,
+					});
+					tabState.visitedUrls.add(url);
+				}
+
+				pageUrl = page.url();
 			}
 
 			log('info', 'tab created', {
@@ -324,13 +595,36 @@ router.post(
 				tabId,
 				userId,
 				sessionKey: resolvedSessionKey,
-				url: page.url(),
+				url: pageUrl,
 			});
-			return res.json({ tabId, url: page.url() });
+			lifecycleController.recordInteractiveActivity();
+			releaseSessionProfileCreate?.(true);
+			releaseSessionProfileCreate = undefined;
+			createdSessionProfile = false;
+			return res.json({ tabId, url: pageUrl });
 		} catch (err) {
+			if (isFirstCreator && createUserId) {
+				if (stagedGeneration) {
+					await rollbackStagedFirstUse(createUserId, stagedGeneration).catch(() => {});
+				} else {
+					rollbackCanonicalMutex(createUserId);
+				}
+			}
+			if (createdSessionProfile && createUserId && createSessionKey) {
+				if (createdSessionProfileSignature) {
+					await rollbackSessionProfileRuntime(createUserId, createSessionKey, createdSessionProfileSignature);
+				} else {
+					clearSessionProfile(createUserId, createSessionKey);
+				}
+			}
+			if (createdDefaultSessionProfileClaim && createUserId && createSessionKey) {
+				clearDefaultSessionProfileClaim(createUserId, createSessionKey);
+			}
+			releaseSessionProfileCreate?.(false);
+			releaseSessionProfileCreate = undefined;
 			const message = err instanceof Error ? err.message : String(err);
 			log('error', 'tab create failed', { reqId: req.reqId, error: message });
-			return res.status(500).json({ error: safeError(err) });
+			return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 		}
 	},
 );
@@ -369,6 +663,10 @@ router.get('/tabs', async (req: Request<unknown, unknown, unknown, { userId?: un
 router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; url?: string; macro?: string; query?: string }>, res: Response) => {
 	const tabId = req.params.tabId;
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { userId, url, macro, query } = req.body;
 		if (!userId) return res.status(400).json({ error: 'userId required' });
 		const found = findTabById(tabId, userId);
@@ -387,10 +685,16 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 					}
 					if (!targetUrl) return { status: 400 as const, body: { error: 'url or macro required' } };
 
-					const urlErr = validateUrl(targetUrl);
+					const urlErr = await validateNavigationUrl(targetUrl, {
+						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
+					});
 					if (urlErr) return { status: 400 as const, body: { error: urlErr } };
 
-					await tabState.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+					await navigateWithSafetyGuard(tabState.page, targetUrl, {
+						allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets,
+						waitUntil: 'domcontentloaded',
+						timeout: 30000,
+					});
 					tabState.visitedUrls.add(targetUrl);
 					tabState.refs = await buildRefs(tabState.page);
 					return { status: 200 as const, body: { ok: true, url: tabState.page.url() } };
@@ -402,18 +706,18 @@ router.post('/tabs/:tabId/navigate', async (req: Request<{ tabId: string }, unkn
 
 		if (result.status !== 200) return res.status(result.status).json(result.body);
 
+		lifecycleController.recordInteractiveActivity();
 		log('info', 'navigated', { reqId: req.reqId, tabId, url: result.body.url });
 		return res.json(result.body);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'navigate failed', { reqId: req.reqId, tabId, error: message });
-		const status = err instanceof Error && err.message?.startsWith('Blocked URL scheme') ? 400 : 500;
-		return res.status(status).json({ error: safeError(err) });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
 
 // Snapshot
-router.get('/tabs/:tabId/snapshot', async (req: Request<{ tabId: string }, unknown, unknown, { userId?: unknown }>, res: Response) => {
+router.get('/tabs/:tabId/snapshot', async (req: Request<{ tabId: string }, unknown, unknown, { userId?: unknown; offset?: string }>, res: Response) => {
 	try {
 		const userId = req.query.userId;
 		if (!userId) return res.status(400).json({ error: 'userId required' });
@@ -423,133 +727,67 @@ router.get('/tabs/:tabId/snapshot', async (req: Request<{ tabId: string }, unkno
 
 		const { tabState } = found;
 		tabState.toolCalls++;
-		const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
+
+		const rawOffset = Number(req.query.offset);
+		const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
+
+		const raw = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
 			withTimeout(snapshotTab(tabState), CONFIG.handlerTimeoutMs, 'snapshot'),
 		);
+		const result = buildSnapshotPayload(raw, offset);
 		log('info', 'snapshot', {
 			reqId: req.reqId,
 			tabId,
 			url: result.url,
-			snapshotLen: (result.snapshot as string | undefined)?.length,
+			snapshotLen: result.snapshot.length,
 			refsCount: result.refsCount,
 		});
 		return res.json(result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'snapshot failed', { reqId: req.reqId, tabId: req.params.tabId, error: message });
-		return res.status(500).json({ error: safeError(err) });
-	}
-});
-
-// Task-aware scoped snapshot (POST so we can pass body params)
-router.post('/tabs/:tabId/snapshot', async (req: Request<{ tabId: string }, unknown, {
-	userId?: unknown;
-	focusSelector?: string;
-	maxLines?: number;
-	rolesFilter?: string[];
-	currentTask?: string;
-	lastAction?: string;
-}>, res: Response) => {
-	try {
-		const { userId, focusSelector, maxLines, rolesFilter, currentTask, lastAction } = req.body;
-		if (!userId) return res.status(400).json({ error: 'userId required' });
-		const tabId = req.params.tabId;
-		const found = findTabById(tabId, userId);
-		if (!found) return res.status(404).json({ error: 'Tab not found' });
-
-		const { tabState } = found;
-		tabState.toolCalls++;
-		const opts = {
-			focusSelector: typeof focusSelector === 'string' ? focusSelector : undefined,
-			maxLines: typeof maxLines === 'number' && maxLines > 0 ? Math.min(maxLines, 5000) : undefined,
-			rolesFilter: Array.isArray(rolesFilter) ? rolesFilter.filter((r): r is string => typeof r === 'string') : undefined,
-			currentTask: typeof currentTask === 'string' ? currentTask : undefined,
-			lastAction: typeof lastAction === 'string' ? lastAction : undefined,
-		};
-		const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
-			withTimeout(snapshotTab(tabState, opts), CONFIG.handlerTimeoutMs, 'snapshot-scoped'),
-		);
-		log('info', 'snapshot-scoped', {
-			reqId: req.reqId,
-			tabId,
-			url: result.url,
-			snapshotLen: result.snapshot.length,
-			refsCount: result.refsCount,
-			scoped: result.scoped,
-			focusSelector: opts.focusSelector,
-			rolesFilter: opts.rolesFilter,
-		});
-		return res.json(result);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		log('error', 'snapshot-scoped failed', { reqId: req.reqId, tabId: req.params.tabId, error: message });
-		return res.status(500).json({ error: safeError(err) });
-	}
-});
-
-// Dialog-only snapshot: auto-detects topmost open dialog
-router.post('/tabs/:tabId/snapshot/dialog', async (req: Request<{ tabId: string }, unknown, { userId?: unknown }>, res: Response) => {
-	try {
-		const { userId } = req.body;
-		if (!userId) return res.status(400).json({ error: 'userId required' });
-		const tabId = req.params.tabId;
-		const found = findTabById(tabId, userId);
-		if (!found) return res.status(404).json({ error: 'Tab not found' });
-
-		const { tabState } = found;
-		tabState.toolCalls++;
-		const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
-			withTimeout(snapshotTabDialog(tabState), CONFIG.handlerTimeoutMs, 'snapshot-dialog'),
-		);
-		if (!result) {
-			log('info', 'snapshot-dialog: no dialog visible', { reqId: req.reqId, tabId });
-			return res.json({ url: tabState.page.url(), snapshot: null, refsCount: 0, selector: null });
-		}
-		log('info', 'snapshot-dialog', {
-			reqId: req.reqId,
-			tabId,
-			url: result.url,
-			selector: result.selector,
-			snapshotLen: result.snapshot.length,
-			refsCount: result.refsCount,
-		});
-		return res.json(result);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		log('error', 'snapshot-dialog failed', { reqId: req.reqId, tabId: req.params.tabId, error: message });
-		return res.status(500).json({ error: safeError(err) });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
 
 // Wait for page ready
 router.post('/tabs/:tabId/wait', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; timeout?: number; waitForNetwork?: boolean }>, res: Response) => {
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { userId, timeout = 10000, waitForNetwork = true } = req.body;
 		const found = findTabById(req.params.tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
 
 		const { tabState } = found;
 		const ready = await waitForPageReady(tabState.page, { timeout, waitForNetwork });
+		lifecycleController.recordInteractiveActivity();
 		return res.json({ ok: true, ready });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'wait failed', { reqId: req.reqId, error: message });
-		return res.status(500).json({ error: safeError(err) });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
 
 // Click
-router.post('/tabs/:tabId/click', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; ref?: string; selector?: string; timeout?: number; force?: boolean; verify?: boolean }>, res: Response) => {
+router.post('/tabs/:tabId/click', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; ref?: string; selector?: string }>, res: Response) => {
 	const tabId = req.params.tabId;
 	try {
-		const { userId, ref, selector, timeout, force, verify } = req.body;
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
+		const { userId, ref, selector } = req.body;
 		if (!userId) return res.status(400).json({ error: 'userId required' });
 		const found = findTabById(tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
 		const { tabState } = found;
 		tabState.toolCalls++;
 		const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
-			withTimeout(clickTab(tabId, tabState, { ref, selector, timeout, force, verify }), CONFIG.handlerTimeoutMs, 'click'),
+			withTimeout(clickTab(tabId, tabState, { ref, selector }), CONFIG.handlerTimeoutMs, 'click'),
 		);
 		const responseObj: Record<string, unknown> = { ...result };
 		const recentDownloads = getRecentDownloads(tabId, 2000);
@@ -561,14 +799,13 @@ router.post('/tabs/:tabId/click', async (req: Request<{ tabId: string }, unknown
 				size: d.size,
 			}));
 		}
-		log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url, strategy: result.strategy, attempts: result.attempts });
+		log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url });
+		lifecycleController.recordInteractiveActivity();
 		return res.json(responseObj);
 	} catch (err) {
-		const statusCode = (err as { statusCode?: number } | null)?.statusCode;
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'click failed', { reqId: req.reqId, tabId, error: message });
-		if (statusCode === 400) return res.status(400).json({ error: message });
-		return res.status(500).json({ error: safeError(err) });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
 
@@ -576,6 +813,10 @@ router.post('/tabs/:tabId/click', async (req: Request<{ tabId: string }, unknown
 router.post('/tabs/:tabId/type', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; ref?: string; selector?: string; text?: string }>, res: Response) => {
 	const tabId = req.params.tabId;
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { userId, ref, selector, text } = req.body;
 		const found = findTabById(tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
@@ -584,13 +825,12 @@ router.post('/tabs/:tabId/type', async (req: Request<{ tabId: string }, unknown,
 		tabState.toolCalls++;
 		const textValue = String(text ?? '');
 		const result = await withTimeout(typeTab(tabId, tabState, { ref, selector, text: textValue }), calculateTypeTimeoutMs(textValue), 'type');
+		lifecycleController.recordInteractiveActivity();
 		return res.json(result);
 	} catch (err) {
-		const statusCode = (err as { statusCode?: number } | null)?.statusCode;
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'type failed', { reqId: req.reqId, error: message });
-		if (statusCode === 400) return res.status(400).json({ error: message });
-		return res.status(500).json({ error: safeError(err) });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
 
@@ -598,36 +838,44 @@ router.post('/tabs/:tabId/type', async (req: Request<{ tabId: string }, unknown,
 router.post('/tabs/:tabId/press', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; key?: string }>, res: Response) => {
 	const tabId = req.params.tabId;
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { userId, key } = req.body;
 		const found = findTabById(tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
 		const { tabState } = found;
 		tabState.toolCalls++;
 		await withTimeout(pressTab(tabId, tabState, String(key ?? '')), CONFIG.handlerTimeoutMs, 'press');
+		lifecycleController.recordInteractiveActivity();
 		return res.json({ ok: true });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'press failed', { reqId: req.reqId, error: message });
-		return res.status(500).json({ error: safeError(err) });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
 
 // Scroll
-router.post('/tabs/:tabId/scroll', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; direction?: 'up' | 'down'; amount?: number }>, res: Response) => {
+router.post('/tabs/:tabId/scroll', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; direction?: 'up' | 'down' | 'left' | 'right'; amount?: number }>, res: Response) => {
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { userId, direction = 'down', amount = 500 } = req.body;
 		const found = findTabById(req.params.tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
 		const { tabState } = found;
 		tabState.toolCalls++;
-		const delta = direction === 'up' ? -amount : amount;
-		await tabState.page.mouse.wheel(0, delta);
-		await tabState.page.waitForTimeout(300);
-		return res.json({ ok: true });
+		const result = await withTimeout(scrollTab(tabState, { direction, amount }), CONFIG.handlerTimeoutMs, 'scroll');
+		lifecycleController.recordInteractiveActivity();
+		return res.json(result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'scroll failed', { reqId: req.reqId, error: message });
-		return res.status(500).json({ error: safeError(err) });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
 
@@ -651,6 +899,10 @@ router.post(
 	) => {
 		const tabId = req.params.tabId;
 		try {
+			if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+				return res.status(403).json({ error: 'Forbidden' });
+			}
+
 			const { userId, selector, ref, deltaX, deltaY, scrollTo } = req.body;
 			const found = findTabById(tabId, userId);
 			if (!found) return res.status(404).json({ error: 'Tab not found' });
@@ -658,13 +910,12 @@ router.post(
 			tabState.toolCalls++;
 
 			const result = await scrollElementTab(tabId, tabState, { selector, ref, deltaX, deltaY, scrollTo });
+			lifecycleController.recordInteractiveActivity();
 			return res.json(result);
 		} catch (err) {
-			const statusCode = (err as { statusCode?: number } | null)?.statusCode;
 			const message = err instanceof Error ? err.message : String(err);
 			log('error', 'scroll-element failed', { reqId: req.reqId, tabId, error: message });
-			if (statusCode === 400) return res.status(400).json({ error: message });
-			return res.status(500).json({ error: safeError(err) });
+			return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 		}
 	},
 );
@@ -681,6 +932,7 @@ router.post(
 			}
 
 			const { userId, expression, timeout } = req.body;
+			if (!userId) return res.status(400).json({ error: 'userId is required' });
 			if (!expression || typeof expression !== 'string') {
 				return res.status(400).json({ error: 'expression is required and must be a string' });
 			}
@@ -694,11 +946,12 @@ router.post(
 			tabState.toolCalls++;
 
 			const result = await evaluateTab(tabId, tabState, { expression, timeout });
+			lifecycleController.recordInteractiveActivity();
 			return res.json(result);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			log('error', 'evaluate failed', { reqId: req.reqId, tabId, error: message });
-			return res.status(500).json({ error: safeError(err) });
+			return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 		}
 	},
 );
@@ -762,6 +1015,7 @@ router.post(
 			);
 
 			if (result.ok) {
+				lifecycleController.recordInteractiveActivity();
 				return res.json(result);
 			}
 
@@ -773,6 +1027,10 @@ router.post(
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			log('error', 'evaluate-extended failed', { reqId: req.reqId, tabId, error: message });
+			const status = getRouteErrorStatus(err);
+			if (status === 400) {
+				return res.status(400).json({ ok: false, error: safeError(err), errorType: 'js_error' });
+			}
 
 			if (message.includes('timed out') || message.includes('Timeout')) {
 				return res.status(408).json({ ok: false, error: message, errorType: 'timeout' });
@@ -792,17 +1050,22 @@ router.post(
 router.post('/tabs/:tabId/back', async (req: Request<{ tabId: string }, unknown, { userId?: unknown }>, res: Response) => {
 	const tabId = req.params.tabId;
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { userId } = req.body;
 		const found = findTabById(tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
 		const { tabState } = found;
 		tabState.toolCalls++;
 		const result = await withTimeout(backTab(tabId, tabState), CONFIG.handlerTimeoutMs, 'back');
+		lifecycleController.recordInteractiveActivity();
 		return res.json(result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'back failed', { reqId: req.reqId, error: message });
-		return res.status(500).json({ error: safeError(err) });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
 
@@ -810,17 +1073,22 @@ router.post('/tabs/:tabId/back', async (req: Request<{ tabId: string }, unknown,
 router.post('/tabs/:tabId/forward', async (req: Request<{ tabId: string }, unknown, { userId?: unknown }>, res: Response) => {
 	const tabId = req.params.tabId;
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { userId } = req.body;
 		const found = findTabById(tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
 		const { tabState } = found;
 		tabState.toolCalls++;
 		const result = await withTimeout(forwardTab(tabId, tabState), CONFIG.handlerTimeoutMs, 'forward');
+		lifecycleController.recordInteractiveActivity();
 		return res.json(result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'forward failed', { reqId: req.reqId, error: message });
-		return res.status(500).json({ error: safeError(err) });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
 
@@ -828,17 +1096,22 @@ router.post('/tabs/:tabId/forward', async (req: Request<{ tabId: string }, unkno
 router.post('/tabs/:tabId/refresh', async (req: Request<{ tabId: string }, unknown, { userId?: unknown }>, res: Response) => {
 	const tabId = req.params.tabId;
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { userId } = req.body;
 		const found = findTabById(tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
 		const { tabState } = found;
 		tabState.toolCalls++;
 		const result = await withTimeout(refreshTab(tabId, tabState), CONFIG.handlerTimeoutMs, 'refresh');
+		lifecycleController.recordInteractiveActivity();
 		return res.json(result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('error', 'refresh failed', { reqId: req.reqId, error: message });
-		return res.status(500).json({ error: safeError(err) });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
 	}
 });
 
@@ -875,27 +1148,15 @@ router.get(
 );
 
 // Screenshot
-router.get('/tabs/:tabId/screenshot', async (req: Request<{ tabId: string }, unknown, unknown, { userId?: unknown; fullPage?: string; type?: string; quality?: string; clipX?: string; clipY?: string; clipW?: string; clipH?: string }>, res: Response) => {
+router.get('/tabs/:tabId/screenshot', async (req: Request<{ tabId: string }, unknown, unknown, { userId?: unknown; fullPage?: string }>, res: Response) => {
 	try {
 		const userId = req.query.userId;
 		const fullPage = req.query.fullPage === 'true';
 		const found = findTabById(req.params.tabId, userId);
 		if (!found) return res.status(404).json({ error: 'Tab not found' });
 		const { tabState } = found;
-		const type = req.query.type === 'jpeg' ? 'jpeg' : 'png';
-		const quality = type === 'jpeg' && req.query.quality ? Number(req.query.quality) : undefined;
-		let clip: { x: number; y: number; width: number; height: number } | undefined;
-		if (req.query.clipX && req.query.clipY && req.query.clipW && req.query.clipH) {
-			const x = Number(req.query.clipX);
-			const y = Number(req.query.clipY);
-			const width = Number(req.query.clipW);
-			const height = Number(req.query.clipH);
-			if ([x, y, width, height].every((n) => Number.isFinite(n) && n >= 0) && width > 0 && height > 0) {
-				clip = { x, y, width, height };
-			}
-		}
-		const { buffer, mime } = await screenshotTab(tabState, { fullPage, type, quality, clip });
-		res.set('Content-Type', mime);
+		const buffer = await screenshotTab(tabState, fullPage);
+		res.set('Content-Type', 'image/png');
 		return res.send(buffer);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -903,6 +1164,78 @@ router.get('/tabs/:tabId/screenshot', async (req: Request<{ tabId: string }, unk
 		return res.status(500).json({ error: safeError(err) });
 	}
 });
+
+// Images
+router.get(
+	'/tabs/:tabId/images',
+	async (
+		req: Request<
+			{ tabId: string },
+			unknown,
+			unknown,
+			{ userId?: unknown; selector?: unknown; extensions?: unknown; resolveBlobs?: unknown; triggerLazyLoad?: unknown }
+		>,
+		res: Response,
+	) => {
+		try {
+			if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
+				return res.status(403).json({ ok: false, error: 'Forbidden' });
+			}
+
+			const userId = req.query.userId;
+			const found = findTabById(req.params.tabId, userId);
+			if (!found) {
+				log('warn', 'images: tab not found', { reqId: req.reqId, tabId: req.params.tabId, userId });
+				return res.status(404).json({ error: 'Tab not found' });
+			}
+
+			const selector = typeof req.query.selector === 'string' && req.query.selector ? req.query.selector : undefined;
+			const extensions = Array.isArray(req.query.extensions)
+				? req.query.extensions.map((value) => String(value)).filter(Boolean)
+				: typeof req.query.extensions === 'string' && req.query.extensions
+					? req.query.extensions
+							.split(',')
+							.map((value) => value.trim())
+							.filter(Boolean)
+					: undefined;
+			const resolveBlobs = String(req.query.resolveBlobs || '').toLowerCase() === 'true';
+			const triggerLazyLoad = String(req.query.triggerLazyLoad || '').toLowerCase() === 'true';
+
+			const { tabState } = found;
+			tabState.toolCalls++;
+
+			const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
+				withTimeout(
+					withTabLock(req.params.tabId, async () =>
+						extractImages(tabState.page, {
+							selector,
+							extensions,
+							resolveBlobs,
+							triggerLazyLoad,
+						}),
+					),
+					CONFIG.handlerTimeoutMs,
+					'images',
+				),
+			);
+
+			return res.json({
+				ok: result.ok,
+				container: result.container,
+				images: result.resources.images,
+				totals: {
+					images: result.totals.images,
+					total: result.totals.images,
+				},
+				metadata: result.metadata,
+			});
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			log('error', 'images failed', { reqId: req.reqId, error: message });
+			return res.status(500).json({ error: safeError(err) });
+		}
+	},
+);
 
 // Stats
 router.get('/tabs/:tabId/stats', async (req: Request<{ tabId: string }, unknown, unknown, { userId?: unknown }>, res: Response) => {
@@ -930,7 +1263,12 @@ router.get('/tabs/:tabId/stats', async (req: Request<{ tabId: string }, unknown,
 // Close tab
 router.delete('/tabs/:tabId', async (req: Request<{ tabId: string }, unknown, { userId?: unknown }>, res: Response) => {
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { userId } = req.body;
+		if (!userId) return res.status(400).json({ error: 'userId is required' });
 		const found = findTabById(req.params.tabId, userId);
 		if (found) {
 			await safePageClose(found.tabState.page);
@@ -941,6 +1279,7 @@ router.delete('/tabs/:tabId', async (req: Request<{ tabId: string }, unknown, { 
 			}
 			log('info', 'tab closed', { reqId: req.reqId, tabId: req.params.tabId, userId });
 		}
+		lifecycleController.recordInteractiveActivity();
 		return res.json({ ok: true });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -952,6 +1291,10 @@ router.delete('/tabs/:tabId', async (req: Request<{ tabId: string }, unknown, { 
 // Close tab group
 router.delete('/tabs/group/:listItemId', async (req: Request<{ listItemId: string }, unknown, { userId?: unknown }>, res: Response) => {
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { userId } = req.body;
 		const sessionsForUser = getSessionsForUser(userId);
 		for (const [sessionKey, session] of sessionsForUser) {
@@ -969,6 +1312,7 @@ router.delete('/tabs/group/:listItemId', async (req: Request<{ listItemId: strin
 				sessionKey,
 			});
 		}
+		lifecycleController.recordInteractiveActivity();
 		return res.json({ ok: true });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -980,10 +1324,15 @@ router.delete('/tabs/group/:listItemId', async (req: Request<{ listItemId: strin
 // Close session
 router.delete('/sessions/:userId', async (req: Request<{ userId: string }>, res: Response) => {
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const userId = normalizeUserId(req.params.userId);
 		await closeSessionsForUser(userId);
 		// Ensure downloads are cleaned even if the session was already partially removed.
 		cleanupUserDownloads(userId);
+		lifecycleController.recordInteractiveActivity();
 		return res.json({ ok: true });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -1000,6 +1349,10 @@ router.post(
 		res: Response,
 	) => {
 		try {
+			if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+				return res.status(403).json({ error: 'Forbidden' });
+			}
+
 			const userId = normalizeUserId(req.params.userId);
 			const { headless } = req.body ?? {};
 
@@ -1009,14 +1362,29 @@ router.post(
 				});
 			}
 
-			// Existing tabs become invalid after context restart.
-			await closeSessionsForUser(userId);
-			await contextPool.restartContext(userId, headless);
+			const existingSessions = getSessionsForUser(userId);
+			const prewarmProfileKey = existingSessions.length === 1 ? existingSessions[0][0] : undefined;
+			const prewarmEntry = prewarmProfileKey ? contextPool.getEntry(prewarmProfileKey) : undefined;
+			const prewarmLaunchSettings =
+				prewarmProfileKey && !prewarmEntry ? getSessionProfileLaunchSettings(userId, prewarmProfileKey) : undefined;
+			const prewarmOptions = prewarmEntry ? prewarmEntry.seedOptions : prewarmLaunchSettings?.contextOverrides ?? undefined;
+			const prewarmProxy = prewarmEntry ? prewarmEntry.proxyConfig : prewarmLaunchSettings?.proxy ?? null;
+			let tabsInvalidated = false;
 
 			let vncUrl: string | undefined;
 			if (headless === true) {
+				if (prewarmProfileKey) {
+					// Existing tabs become invalid after context restart/close.
+					await closeSessionsForUser(userId, { clearProfiles: false });
+					tabsInvalidated = true;
+				}
+				contextPool.setHeadlessOverride(userId, headless);
 				await stopVnc(userId).catch(() => {});
-			} else {
+			} else if (prewarmProfileKey) {
+				// Existing tabs become invalid after context restart.
+				await closeSessionsForUser(userId, { clearProfiles: false });
+				tabsInvalidated = true;
+				await contextPool.restartContext(userId, headless, prewarmProfileKey, prewarmOptions, prewarmProxy);
 				const displayNum = getDisplayForUser(userId);
 				if (displayNum) {
 					try {
@@ -1027,15 +1395,22 @@ router.post(
 						log('warn', 'vnc start failed after display toggle', { userId, error: vncMessage, displayNum });
 					}
 				}
+			} else {
+				contextPool.setHeadlessOverride(userId, headless);
 			}
 
 			const modeLabel = headless === false ? 'headed mode' : headless === 'virtual' ? 'virtual display mode' : 'headless mode';
 			return res.json({
 				ok: true,
 				headless,
+				tabsInvalidated,
 				...(vncUrl
 					? { vncUrl, message: 'Browser visible via VNC' }
-					: { message: `Browser restarted in ${modeLabel}. Previous tabs invalidated — create new tabs.` }),
+					: {
+							message: tabsInvalidated
+								? `Display mode updated to ${modeLabel}. Previous tabs invalidated — create new tabs.`
+								: `Display mode override saved as ${modeLabel}. Existing tabs preserved; new contexts use the requested mode.`,
+						}),
 				userId,
 			});
 		} catch (err) {
@@ -1148,6 +1523,10 @@ router.get('/downloads/:downloadId/content', async (req, res) => {
 // Downloads: delete
 router.delete('/downloads/:downloadId', async (req, res) => {
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const userId = (req.body as any)?.userId || (req.query.userId as string);
 		if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
 		const deleted = deleteDownload(req.params.downloadId, userId);
@@ -1163,6 +1542,10 @@ router.delete('/downloads/:downloadId', async (req, res) => {
 // Extract resources from a scoped container
 router.post('/tabs/:tabId/extract-resources', async (req, res) => {
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { tabId } = req.params as { tabId: string };
 		const { userId, selector, types, extensions, resolveBlobs, triggerLazyLoad } = req.body as any;
 		if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
@@ -1195,9 +1578,58 @@ router.post('/tabs/:tabId/extract-resources', async (req, res) => {
 	}
 });
 
+router.post('/tabs/:tabId/extract-structured', async (req, res) => {
+	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
+		const { tabId } = req.params as { tabId: string };
+		const { userId, schema } = req.body as { userId?: unknown; schema?: unknown };
+		if (!userId || typeof userId !== 'string') {
+			return res.status(400).json({ ok: false, error: 'userId required' });
+		}
+		if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+			return res.status(400).json({ ok: false, error: 'schema must be an object' });
+		}
+		const found = findTabById(tabId, userId);
+		if (!found) return res.status(404).json({ ok: false, error: 'Tab not found' });
+		const { tabState } = found;
+		tabState.toolCalls++;
+
+		const result = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
+			withTimeout(
+				withTabLock(tabId, async () => extractStructuredData(tabState.page, schema as StructuredExtractRootSchema)),
+				CONFIG.handlerTimeoutMs,
+				'extract-structured',
+			),
+		);
+		return res.json(result);
+	} catch (err) {
+		if (err instanceof StructuredExtractSchemaError) {
+			return res.status(err.statusCode).json({ ok: false, error: err.message });
+		}
+		if (err instanceof StructuredExtractRuntimeError) {
+			return res.status(err.statusCode).json({
+				ok: false,
+				error: 'Structured extraction failed',
+				fieldPath: err.fieldPath,
+				reason: err.reason,
+			});
+		}
+		const message = err instanceof Error ? err.message : String(err);
+		log('error', 'structured extract failed', { error: message });
+		return res.status(500).json({ ok: false, error: safeError(err) });
+	}
+});
+
 // Batch download from a scoped container
 router.post('/tabs/:tabId/batch-download', async (req, res) => {
 	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
 		const { tabId } = req.params as { tabId: string };
 		const body = req.body as any;
 		const userId = body?.userId;
@@ -1316,12 +1748,13 @@ router.post('/tabs/:tabId/trace/stop', async (req, res) => {
 			return res.json({
 				ok: true,
 				path: result.path,
+				filename: result.path ? basename(result.path) : undefined,
 				size: result.size,
 				alreadyStopped: true,
 				message: 'Trace was already stopped by chunk stop',
 			});
 		}
-		return res.json({ ok: true, ...result });
+		return res.json({ ok: true, ...result, filename: basename(result.path) });
 	} catch (err) {
 		const status = getTracingErrorStatus(err);
 		return res.status(status).json({ ok: false, error: safeError(err) });
@@ -1375,7 +1808,7 @@ router.post('/tabs/:tabId/trace/chunk/stop', async (req, res) => {
 		if (!tab) return res.status(404).json({ ok: false, error: 'Tab not found' });
 
 		const result = await stopTracingChunk(userId, tab.page.context(), path);
-		return res.json({ ok: true, ...result });
+		return res.json({ ok: true, ...result, filename: basename(result.path) });
 	} catch (err) {
 		const status = getTracingErrorStatus(err);
 		return res.status(status).json({ ok: false, error: safeError(err) });
@@ -1402,6 +1835,67 @@ router.get('/tabs/:tabId/trace/status', async (req, res) => {
 		return res.json({ ok: true, ...state });
 	} catch (err) {
 		return res.status(500).json({ ok: false, error: safeError(err) });
+	}
+});
+
+router.get('/sessions/:userId/traces', async (req, res) => {
+	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
+		const userId = normalizeUserId(req.params.userId);
+		return res.json({ ok: true, traces: listTraceArtifacts(userId) });
+	} catch (err) {
+		return res.status(500).json({ ok: false, error: safeError(err) });
+	}
+});
+
+router.get('/sessions/:userId/traces/:filename', async (req, res) => {
+	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
+		const userId = normalizeUserId(req.params.userId);
+		const filename = req.params.filename;
+		const filePath = resolveTraceArtifactPath(userId, filename);
+
+		const safeName = filename.replace(/[\r\n\0"]/g, '');
+		res.setHeader('Content-Type', 'application/zip');
+		res.setHeader('Content-Disposition', `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`);
+
+		const stream = fs.createReadStream(filePath);
+		stream.on('error', (streamErr) => {
+			if (!res.headersSent) {
+				const status = getTraceArtifactErrorStatus(streamErr);
+				res.removeHeader('Content-Disposition');
+				res.removeHeader('Content-Type');
+				res.status(status).json({ ok: false, error: safeError(streamErr) });
+				return;
+			}
+			res.destroy();
+		});
+		stream.pipe(res);
+	} catch (err) {
+		const status = getTraceArtifactErrorStatus(err);
+		return res.status(status).json({ ok: false, error: safeError(err) });
+	}
+});
+
+router.delete('/sessions/:userId/traces/:filename', async (req, res) => {
+	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
+		const userId = normalizeUserId(req.params.userId);
+		const filename = req.params.filename;
+		deleteTraceArtifact(userId, filename);
+		return res.json({ ok: true });
+	} catch (err) {
+		const status = getTraceArtifactErrorStatus(err);
+		return res.status(status).json({ ok: false, error: safeError(err) });
 	}
 });
 

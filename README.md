@@ -11,6 +11,7 @@
 
 - [Why CamoFox?](#why-camofox)
 - [Features](#features)
+- [Preview Status](#preview-status)
 - [Quick Start](#quick-start)
 - [CLI](#cli)
 - [Console Capture](#console-capture)
@@ -19,6 +20,7 @@
 - [Usage with AI Agents](#usage-with-ai-agents)
 - [Architecture](#architecture)
 - [API Reference](#api-reference)
+- [Structured Extract](#structured-extract)
 - [Search Macros](#search-macros)
 - [Geo Presets](#geo-presets)
 - [Environment Variables](#environment-variables)
@@ -50,19 +52,53 @@
 - **Multi-Session** — concurrent isolated browser contexts per `userId` (defaults: max 50 sessions, max 10 tabs/session)
 - **Persistent Browser Profiles** — Each user gets a dedicated Firefox profile. Cookies, localStorage, IndexedDB, and all browser storage persist across sessions automatically.
 - **Geo Presets** — 8 built-in region presets (locale/timezone/geolocation) + custom presets file
+- **Session-Level Proxy/Geo Overrides** — per-session proxy configuration via named profiles or raw credentials, with hybrid geo modes (`explicit-wins` or `proxy-locked`)
 - **14 Search Macros** — Google, YouTube, Amazon, Reddit (search + subreddit JSON), Wikipedia, Twitter, Yelp, Spotify, Netflix, LinkedIn, Instagram, TikTok, Twitch
 - **Element Refs** — accessibility snapshots annotated with stable `eN` element references for precise interaction
-- **Cookie Persistence** — import Netscape/Playwright-style cookies into a session (optional, gated by API key)
+- **Cookie Persistence** — import Netscape/Playwright-style cookies into a session (bearer auth required only when `CAMOFOX_API_KEY` is set)
 - **OpenClaw Plugin** — OpenClaw-compatible endpoints (`/start`, `/tabs/open`, `/act`, etc.)
 - **TypeScript** — strict mode, typed request shapes, modular Express routes
-- **YouTube Transcript Extraction** — yt-dlp primary pipeline with browser fallback
+- **YouTube Transcript Extraction** — yt-dlp + browser fallback (service-level; no public API route currently exposed)
 - **Snapshot Pagination** — offset-based windowing for large page snapshots
+- **Image Listing Route** — image-only extraction over the shared resource extractor with selector, extension, lazy-load, and blob-resolution controls
+- **Structured Extract** — deterministic schema-driven JSON extraction across core API, CLI, and OpenClaw without arbitrary JavaScript
 - **Browser Health Monitoring** — health probe with recovery/degraded state tracking
 - 🖥️ **CLI Mode** — 50+ commands for terminal-based browser automation
 - 🔐 **Auth Vault** — AES-256-GCM encrypted credential storage (LLM-safe)
 - 📜 **Pipeline Scripting** — Execute command scripts from files
 - 🔍 **Console Capture** — capture and filter browser console messages and uncaught errors
 - 📼 **Playwright Tracing** — record and export Playwright traces for debugging
+- 🗂️ **Trace Artifact Management** — list, download, and delete managed trace ZIPs per user session
+
+## Preview Status
+
+CamoFox Browser Server is in **Preview** (Phase 1). Preview releases are functional for browser automation and agent integration, but carry specific compatibility commitments and explicit non-goals.
+
+### What Preview Means
+- The REST API and CLI are usable for agent workflows today; [CamoFox MCP](https://github.com/redf0x1/camofox-mcp) is available as an external companion integration
+- New features may be added between minor versions
+- Backward-compatible aliases are maintained for renamed or moved endpoints (see [Compatibility Policy](#compatibility-policy))
+- Local state (profiles, registries, sessions) uses versioned formats with fail-closed integrity checks
+
+### What Preview Does NOT Guarantee
+- **Frozen API surface** — endpoint behavior, request shapes, or response formats may change between minor versions
+- **Automatic local-state migration** — browser profiles, download registries, and session files use versioned sidecar formats; incompatible upgrades require manual reset (see [Local State Recovery](#local-state-recovery))
+- **Downgrade safety** — rolling back to an older version may require clearing local state
+- **Fixed GA timeline** — promotion to GA requires meeting evidence-based exit criteria, not a calendar date
+
+### Compatibility Policy
+During Preview, CamoFox follows an **additive-only deprecation model**:
+- **Legacy aliases** (e.g., `listItemId` accepted alongside `sessionKey`, OpenClaw `/act` routing to core endpoints) continue to work alongside their replacements
+- **Deprecated fields** are accepted silently; no removal until GA or a documented migration window with advance notice in CHANGELOG
+- **No existing endpoint** is removed in a minor version — removals happen only in major versions with prior CHANGELOG notice
+
+### Local State Recovery
+Browser profiles, download registries, and CLI session files use versioned sidecar formats. When upgrading CamoFox:
+- **Compatible versions**: State loads normally
+- **Incompatible or corrupt state**: The server refuses to load incompatible profiles and download registries; the CLI rejects incompatible saved-session files. Both log an actionable error with the specific recovery path.
+- **Recovery**: Delete the affected profile directory, session file, or download registry as indicated in the error message. Clean state is recreated on next use.
+
+Supported sidecars include limited forward-migration paths (e.g., fingerprint v0 → v1); when no migration path exists for a given version, the server refuses to load the file and logs an actionable recovery message. There is no silent repair or downgrade path — this fail-closed default prevents data corruption at the cost of manual intervention on unsupported version jumps.
 
 ## Quick Start
 
@@ -102,6 +138,9 @@ docker run -d \
   --name camofox-browser \
   -p 9377:9377 \
   -p 6080:6080 \
+  -e CAMOFOX_HOST=0.0.0.0 \
+  -e CAMOFOX_AUTH_MODE=auto \
+  -e CAMOFOX_API_KEY=change-me \
   -v ~/.camofox:/home/node/.camofox \
   camofox-browser
 ```
@@ -117,9 +156,11 @@ services:
     ports:
       - "9377:9377"
     environment:
+      CAMOFOX_HOST: "0.0.0.0"
       CAMOFOX_PORT: "9377"
-      # Optional auth gates
-      # CAMOFOX_API_KEY: "change-me"
+      # auto requires CAMOFOX_API_KEY when CAMOFOX_HOST is non-loopback
+      CAMOFOX_AUTH_MODE: "auto"
+      CAMOFOX_API_KEY: "change-me"
       # CAMOFOX_ADMIN_KEY: "change-me"
       # Optional: proxy routing (also enables Camoufox geoip mode)
       # PROXY_HOST: ""
@@ -146,7 +187,7 @@ CamoFox Browser includes a powerful CLI for browser automation directly from the
 npm install -g camofox-browser
 
 # Or use npx (no install needed)
-npx camofox open https://example.com
+npx camofox-browser open https://example.com
 ```
 
 ### Quick Start
@@ -176,6 +217,7 @@ camofox get-url                        # Get current page URL
 camofox get-text                       # Get page text content
 camofox get-links                      # Get all links on page
 camofox get-tabs                       # List open tabs
+camofox extract-structured @schema.json # Extract deterministic JSON from a schema
 
 # Interaction
 camofox click <ref>                    # Click element by ref
@@ -353,7 +395,7 @@ This works with **Claude Code**, **Codex**, **Cursor**, **Gemini CLI**, **GitHub
 | Skill | Focus | Best For |
 |-------|-------|----------|
 | `camofox-browser` | Full coverage (CLI + API + OpenClaw) | Complete reference |
-| `camofox-cli` | CLI-only (50 commands) | Terminal-first workflows |
+| `camofox-cli` | CLI-only (50+ commands) | Terminal-first workflows |
 | `dogfood` | QA testing workflow | Systematic web app testing |
 | `gemini-image` | Gemini image generation | AI image automation |
 | `reddit` | Reddit automation | Reddit posting/commenting |
@@ -426,57 +468,75 @@ AI Agent (MCP / OpenClaw / REST Client)
 
 Base URL: `http://localhost:9377`
 
+> **Security defaults:** `CAMOFOX_HOST` now defaults to `127.0.0.1`, and `CAMOFOX_AUTH_MODE=auto` keeps local loopback usage open while requiring `CAMOFOX_API_KEY` when you bind beyond loopback (for example `0.0.0.0` in Docker or PaaS). Set `CAMOFOX_AUTH_MODE=required` to require API-key auth everywhere. Set `CAMOFOX_AUTH_MODE=disabled` only for trusted private agent networks whose clients cannot send bearer tokens; this disables API-key auth for protected endpoints and keeps private-network navigation blocked. On non-loopback binds, navigation targets on loopback/private/link-local/metadata hosts are blocked by default unless you explicitly set `CAMOFOX_ALLOW_PRIVATE_NETWORK=true`. If you also configure `PROXY_HOST`/`PROXY_PORT`, exposed deployments must opt into `CAMOFOX_ALLOW_PRIVATE_NETWORK=true` until proxy-side private-target validation exists.
+
+### API Documentation
+
+The Camofox Browser API includes OpenAPI 3.1.0 docs for a representative subset of the shipped route surface:
+
+- **Interactive API Explorer**: [http://localhost:9377/api/docs](http://localhost:9377/api/docs) — Swagger UI with live request testing
+- **OpenAPI Specification**: [http://localhost:9377/openapi.json](http://localhost:9377/openapi.json) — Machine-readable OpenAPI 3.1.0 spec
+
+The OpenAPI spec covers a representative subset of core and OpenClaw endpoints, including request schemas, response shapes, authentication requirements, and validation rules.
+
 ### Core Endpoints
 
-Note: For any endpoint that targets an existing tab (`/tabs/:tabId/...`), the server resolves `tabId` **within a `userId` scope**. If you omit `userId`, you will typically get `404 Tab not found`.
+Note: For any endpoint that targets an existing tab (`/tabs/:tabId/...`), the server resolves `tabId` **within a `userId` scope**. If you omit `userId` from the request body, the server returns `400 { "error": "userId is required" }`. If `userId` is present but the tab belongs to a different user, the server returns `404 Tab not found` — except `DELETE /tabs/:tabId`, which is idempotent and returns `200 { "ok": true }` when no matching tab is found under the given `userId` scope (the tab is already gone from the caller's perspective). For endpoints that accept `userId` as a query parameter (e.g. `GET /tabs/:tabId/snapshot`), omitting it may also result in a `400` or `404` depending on the route.
 
 | Method | Endpoint | Description | Required | Auth |
 |--------|----------|-------------|----------|------|
-| POST | `/sessions/:userId/cookies` | Import cookies into a user session (Playwright cookie objects) | Path: `userId`; Body: `{ "cookies": Cookie[] }` | `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/sessions/:userId/cookies` | Import cookies into a user session (Playwright cookie objects) | Path: `userId`; Body: `{ "cookies": Cookie[] }` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/health` | Health check (also pre-launches the browser) | None | None |
 | GET | `/presets` | List available geo presets (built-in + custom) | None | None |
-| POST | `/tabs` | Create a new tab (supports `preset` + per-field overrides) | Body: `userId` + (`sessionKey` or `listItemId`) | None |
+| POST | `/tabs` | Create a new tab (supports `preset` + per-field overrides) | Body: `userId` + (`sessionKey` or `listItemId`) | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/tabs?userId=...` | List all tabs for a user (OpenClaw-compatible response shape) | Query: `userId` | None |
-| POST | `/tabs/:tabId/navigate` | Navigate to a URL, or expand a search `macro` + `query` | Body: `userId` + (`url` or `macro`) | None |
+| POST | `/tabs/:tabId/navigate` | Navigate to a URL, or expand a search `macro` + `query` | Body: `userId` + (`url` or `macro`) | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/tabs/:tabId/snapshot?userId=...` | Accessibility snapshot annotated with `eN` element refs | Query: `userId` | None |
-| POST | `/tabs/:tabId/wait` | Wait for page readiness (DOM + optional network idle) | Body: `userId` | None |
-| POST | `/tabs/:tabId/click` | Click by `ref` (e.g. `e12`) or CSS `selector` | Body: `userId` + (`ref` or `selector`) | None |
-| POST | `/tabs/:tabId/type` | Type into an element by `ref` or CSS `selector` | Body: `userId` + (`ref` or `selector`) + `text` | None |
-| POST | `/tabs/:tabId/press` | Press a key (e.g. `Enter`, `Escape`) | Body: `userId` + `key` | None |
-| POST | `/tabs/:tabId/scroll` | Scroll up/down by pixels | Body: `userId` | None |
-| POST | `/tabs/:tabId/scroll-element` | Scroll specific element into view | Body: userId, ref/selector | None |
-| POST | `/tabs/:tabId/back` | Go back | Body: `userId` | None |
-| POST | `/tabs/:tabId/forward` | Go forward | Body: `userId` | None |
-| POST | `/tabs/:tabId/refresh` | Refresh | Body: `userId` | None |
+| POST | `/tabs/:tabId/wait` | Wait for page readiness (DOM + optional network idle) | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/click` | Click by `ref` (e.g. `e12`) or CSS `selector` | Body: `userId` + (`ref` or `selector`) | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/type` | Type into an element by `ref` or CSS `selector` | Body: `userId` + (`ref` or `selector`) + `text` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/press` | Press a key (e.g. `Enter`, `Escape`) | Body: `userId` + `key` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/scroll` | Scroll up/down/left/right by pixels | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/scroll-element` | Scroll specific element into view | Body: userId, ref/selector | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/back` | Go back | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/forward` | Go forward | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/refresh` | Refresh | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/tabs/:tabId/links?userId=...&limit=50&offset=0` | Extract links (paginated) | Query: `userId` | None |
+| GET | `/tabs/:tabId/images?userId=...` | List extracted images | Query: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/tabs/:tabId/screenshot?userId=...&fullPage=true` | Screenshot (PNG bytes) | Query: `userId` | None |
 | GET | `/tabs/:tabId/stats?userId=...` | Tab stats + visited URLs | Query: `userId` | None |
-| DELETE | `/tabs/:tabId` | Close a tab (expects JSON body: `{ "userId": "..." }`) | Body: `userId` | None |
-| DELETE | `/tabs/group/:listItemId` | Close a tab group (expects JSON body: `{ "userId": "..." }`) | Body: `userId` | None |
-| DELETE | `/sessions/:userId` | Close all sessions for a user | Path: `userId` | None |
+| DELETE | `/tabs/:tabId` | Close a tab (expects JSON body: `{ "userId": "..." }`) | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| DELETE | `/tabs/group/:listItemId` | Close a tab group (expects JSON body: `{ "userId": "..." }`) | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| DELETE | `/sessions/:userId` | Close all sessions for a user | Path: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/sessions/:userId/toggle-display` | Toggle display mode (headless/headed/virtual) | Path: `userId`; Body: `{ "headless": true\|false\|"virtual" }` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/tabs/:tabId/cookies` | Export tab cookies | Query: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/tabs/:tabId/downloads` | List tab downloads | Query: `userId` | None |
 | GET | `/users/:userId/downloads` | List user downloads | Path: `userId` | None |
 | GET | `/downloads/:downloadId` | Download metadata | Query: `userId` | None |
 | GET | `/downloads/:downloadId/content` | Stream download content | Query: `userId` | None |
-| DELETE | `/downloads/:downloadId` | Delete tracked download | Body or Query: `userId` | None |
-| POST | `/tabs/:tabId/extract-resources` | Extract downloadable resources | Body: `userId` | None |
-| POST | `/tabs/:tabId/batch-download` | Batch download resources | Body: `userId` | None |
+| DELETE | `/downloads/:downloadId` | Delete tracked download | Body or Query: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/extract-resources` | Extract downloadable resources | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/batch-download` | Batch download resources | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | POST | `/tabs/:tabId/resolve-blobs` | Resolve blob URLs to base64 | Body: `userId` + `urls[]` | None |
 | POST | `/tabs/:tabId/trace/start` | Start trace recording | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | POST | `/tabs/:tabId/trace/stop` | Stop and save trace ZIP | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | POST | `/tabs/:tabId/trace/chunk/start` | Start trace chunk | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | POST | `/tabs/:tabId/trace/chunk/stop` | Stop chunk and save ZIP | Body: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/tabs/:tabId/trace/status` | Check trace status | Query: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| GET | `/sessions/:userId/traces` | List managed trace ZIPs for a user | Path: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| GET | `/sessions/:userId/traces/:filename` | Download a managed trace ZIP | Path: `userId`, `filename` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| DELETE | `/sessions/:userId/traces/:filename` | Delete a managed trace ZIP | Path: `userId`, `filename` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/tabs/:tabId/console` | Get console messages | Query: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/tabs/:tabId/errors` | Get uncaught JS errors | Query: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | POST | `/tabs/:tabId/console/clear` | Clear console + errors | Body or Query: `userId` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+| POST | `/tabs/:tabId/extract-structured` | Extract deterministic JSON from a structured schema | Body: `userId` + `schema` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 
 ### Toggle Display Mode
 ```bash
 POST /sessions/:userId/toggle-display
 {"headless": "virtual"}
 ```
+**Auth:** Conditional — requires `Authorization: Bearer $CAMOFOX_API_KEY` when `CAMOFOX_AUTH_MODE=required` or when `auto` mode has an API key configured. No auth is required in `CAMOFOX_AUTH_MODE=disabled`.
 Switch browser between headless and headed mode. When encountering CAPTCHAs or issues requiring visual interaction, switch to headed mode to show the browser window.
 
 Returns:
@@ -508,7 +568,7 @@ The VNC session auto-terminates after 2 minutes (configurable via `CAMOFOX_VNC_T
 ### Evaluate JavaScript
 Execute a JavaScript expression in the page context and return the JSON-serializable result.
 
-Auth: required only when `CAMOFOX_API_KEY` is set on the server; otherwise no auth is required.
+Auth: required when `CAMOFOX_AUTH_MODE=required` or when `auto` mode has an API key configured; no auth is required in `CAMOFOX_AUTH_MODE=disabled`.
 
 Note: async expressions must be wrapped in an async IIFE (for example, `(async () => { ... })()`). Top-level `await` is not supported.
 
@@ -521,7 +581,7 @@ Returns: `{"ok": true, "result": "Page Title", "resultType": "string", "truncate
 ### Evaluate JavaScript (Extended)
 Execute a long-running JavaScript expression (up to 300s timeout). Conditionally API-key protected. Rate limited.
 
-Auth: required only when `CAMOFOX_API_KEY` is set on the server; otherwise no auth is required.
+Auth: required when `CAMOFOX_AUTH_MODE=required` or when `auto` mode has an API key configured; no auth is required in `CAMOFOX_AUTH_MODE=disabled`.
 
 Note: async expressions must be wrapped in an async IIFE (for example, `(async () => { ... })()`). Top-level `await` is not supported.
 
@@ -538,12 +598,75 @@ OpenClaw-compatible aliases for agent integrations.
 | Method | Endpoint | Description | Required | Auth |
 |--------|----------|-------------|----------|------|
 | GET | `/` | Status (alias of `/health`) | None | None |
-| POST | `/tabs/open` | Open tab (OpenClaw request/response shape) | Body: `userId` + `url` | None |
+| POST | `/tabs/open` | Open tab (OpenClaw request/response shape) | Body: `userId` + `url` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | POST | `/start` | Start browser engine | None | None |
 | POST | `/stop` | Stop browser engine | None | `x-admin-key: $CAMOFOX_ADMIN_KEY` |
-| POST | `/navigate` | Navigate (OpenClaw request shape: `targetId` in body) | Body: `userId` + `targetId` + `url` | None |
+| POST | `/navigate` | Navigate (OpenClaw request shape: `targetId` in body) | Body: `userId` + `targetId` + `url` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
 | GET | `/snapshot?userId=...&targetId=...` | Snapshot (OpenClaw response shape) | Query: `userId` + `targetId` | None |
-| POST | `/act` | Combined actions (`click`, `type`, `press`, `scroll`, `scrollIntoView`, `hover`, `wait`, `close`) | Body: `userId` + `targetId` + `kind` | None |
+| POST | `/act` | Combined actions (`click`, `type`, `press`, `scroll`, `scrollIntoView`, `hover`, `wait`, `close`, `extractStructured`) | Body: `userId` + `targetId` + `kind` | Conditional: `Authorization: Bearer $CAMOFOX_API_KEY` |
+
+### Structured Extract
+
+Structured extract returns deterministic JSON from a DOM schema without arbitrary JavaScript. Use it when you want stable data contracts instead of ad-hoc `evaluate()` calls.
+
+Core API:
+
+```bash
+curl -X POST "$CAMOFOX_URL/tabs/$TAB_ID/extract-structured" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "userId": "agent1",
+    "schema": {
+      "kind": "object",
+      "fields": {
+        "title": { "kind": "text", "selector": "h1", "required": true, "trim": true },
+        "products": {
+          "kind": "list",
+          "selector": ".product",
+          "item": {
+            "kind": "object",
+            "fields": {
+              "name": { "kind": "text", "selector": ".name", "required": true, "trim": true },
+              "href": { "kind": "url", "selector": "a.product-link", "attr": "href", "required": true }
+            }
+          }
+        }
+      }
+    }
+  }'
+```
+
+CLI:
+
+```bash
+camofox extract-structured @schema.json <tabId> --user <userId> --format json
+```
+
+OpenClaw:
+
+```bash
+curl -X POST "$CAMOFOX_URL/act" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "kind": "extractStructured",
+    "targetId": "tab-123",
+    "userId": "agent1",
+    "schema": {
+      "kind": "object",
+      "fields": {
+        "title": { "kind": "text", "selector": "h1", "required": true }
+      }
+    }
+  }'
+```
+
+Notes:
+
+- invalid schemas fail with HTTP 400
+- required runtime misses fail the whole request with HTTP 422 and `fieldPath`
+- optional scalar/object/list nodes normalize to `null` / `null` / `[]`
+- selectors must be CSS; no XPath, arbitrary JavaScript, or AI extraction
+- raw resource extraction and structured extraction stay separate on purpose
 
 ## Search Macros
 
@@ -591,6 +714,119 @@ curl -X POST http://localhost:9377/tabs \
 
 Custom presets: set `CAMOFOX_PRESETS_FILE=/path/to/presets.json` (JSON object; keys become preset names).
 
+## Session-Level Proxy and Geo Overrides
+
+CamoFox supports session-level proxy and geolocation configuration with a hybrid model that combines server defaults with per-session overrides.
+
+### Proxy Configuration Model
+
+**Server-level baseline** (via environment variables):
+- `PROXY_HOST`, `PROXY_PORT`, `PROXY_USERNAME`, `PROXY_PASSWORD` — applied as the default for all sessions
+- Enables Camoufox geoip mode when configured
+
+**Session-level overrides** (via `POST /tabs` or CLI):
+- `proxyProfile` — select a named proxy profile from `CAMOFOX_PROXY_PROFILES_FILE`
+- `proxy` — provide raw proxy fields (`host`, `port`, `username`, `password`) directly
+- Session-level proxy overrides the server baseline for that specific `userId + sessionKey` combination
+
+**Session identity rules**:
+- The same `userId` may run different `sessionKey` profiles in parallel with different proxy/geo configurations
+- The same `userId + sessionKey` combination maintains a stable proxy/geo identity — requests with conflicting proxy/geo fields are rejected
+- Session reuse and cleanup scope proxy/geo identity by `userId + sessionKey`, not just `userId`
+
+### Geo Mode Behavior
+
+CamoFox offers two geo modes that control how explicit geo fields (locale, timezone, geolocation) interact with proxy-derived geo:
+
+**`geoMode=explicit-wins`** (default):
+- Explicit geo fields (locale, timezone, geolocation) remain authoritative
+- Proxy-derived geo suggestions are ignored
+- Use this mode when you want precise geo control regardless of proxy location
+
+**`geoMode=proxy-locked`**:
+- Explicit geo fields that conflict with proxy-derived geo are rejected
+- Proxy-derived geo is authoritative
+- Use this mode to ensure geo consistency with proxy exit location
+
+### CLI Examples
+
+Session-level proxy with named profile:
+```bash
+camofox open https://example.com --proxy-profile tokyo-exit --user agent1
+```
+
+Session-level proxy with raw fields:
+```bash
+camofox open https://example.com \
+  --proxy-host proxy.example.com \
+  --proxy-port 8080 \
+  --proxy-username user \
+  --proxy-password pass \
+  --user agent1
+```
+
+Combine proxy with geo mode:
+```bash
+camofox open https://example.com \
+  --proxy-profile london-exit \
+  --geo uk \
+  --geo-mode proxy-locked \
+  --user agent1
+```
+
+### API Examples
+
+Using a named proxy profile with explicit geo:
+```bash
+curl -X POST http://localhost:9377/tabs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "userId": "agent1",
+    "sessionKey": "task1",
+    "url": "https://example.com",
+    "proxyProfile": "tokyo-exit",
+    "preset": "japan",
+    "geoMode": "explicit-wins"
+  }'
+```
+
+Using raw proxy fields with proxy-locked geo:
+```bash
+curl -X POST http://localhost:9377/tabs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "userId": "agent1",
+    "sessionKey": "task2",
+    "url": "https://example.com",
+    "proxy": {
+      "host": "proxy.example.com",
+      "port": 8080,
+      "username": "user",
+      "password": "pass"
+    },
+    "geoMode": "proxy-locked"
+  }'
+```
+
+### Named Proxy Profiles
+
+Define proxy profiles in a JSON file and point `CAMOFOX_PROXY_PROFILES_FILE` to it:
+
+```json
+{
+  "tokyo-exit": {
+    "server": "http://tokyo.proxy.example.com:8080",
+    "username": "user",
+    "password": "pass"
+  },
+  "london-exit": {
+    "server": "http://london.proxy.example.com:8080"
+  }
+}
+```
+
+Then use profiles by name in API requests or CLI commands.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -598,8 +834,11 @@ Custom presets: set `CAMOFOX_PRESETS_FILE=/path/to/presets.json` (JSON object; k
 | `CAMOFOX_PORT` | `9377` | Server port |
 | `PORT` | (optional) | Alternative port env var (common in PaaS) |
 | `NODE_ENV` | `development` | Node environment |
+| `CAMOFOX_HOST` | `127.0.0.1` | Server bind host. Set `0.0.0.0` for Docker/PaaS/network exposure. Non-loopback binds require `CAMOFOX_API_KEY` unless `CAMOFOX_AUTH_MODE=disabled`. |
 | `CAMOFOX_ADMIN_KEY` | (empty) | Required for `POST /stop` (sent via `x-admin-key`) |
-| `CAMOFOX_API_KEY` | (empty) | Enables cookie import endpoint; sent via `Authorization: Bearer ...` |
+| `CAMOFOX_AUTH_MODE` | `auto` | API-key policy: `auto` allows loopback without auth and requires `CAMOFOX_API_KEY` for non-loopback binds; `required` requires `CAMOFOX_API_KEY` for every bind; `disabled` disables API-key auth for protected endpoints and is only for trusted private agent networks. |
+| `CAMOFOX_API_KEY` | (empty) | Guards protected endpoints (tab creation, navigation, interaction, session management, downloads, image extraction, tracing, console) via `Authorization: Bearer` header when set. Required in `CAMOFOX_AUTH_MODE=required`, and required by `auto` whenever `CAMOFOX_HOST` exposes the server beyond loopback. Must be unset when `CAMOFOX_AUTH_MODE=disabled`. |
+| `CAMOFOX_ALLOW_PRIVATE_NETWORK` | `true` on loopback binds, `false` otherwise | Allows navigation to loopback/private/link-local/metadata targets. Leave unset for the safe default; enable only for trusted deployments that intentionally need internal-network reachability. |
 | `CAMOFOX_HEADLESS` | `true` | Display mode: `true` (headless), `false` (headed), `virtual` (Xvfb) |
 | `CAMOFOX_VNC_RESOLUTION` | `1920x1080x24` | Virtual Xvfb display resolution (`WIDTHxHEIGHTxDEPTH`) |
 | `CAMOFOX_VNC_TIMEOUT_MS` | `120000` | Max VNC session duration in ms before auto-stop |
@@ -613,28 +852,63 @@ Custom presets: set `CAMOFOX_PRESETS_FILE=/path/to/presets.json` (JSON object; k
 | `CAMOFOX_MAX_BATCH_CONCURRENCY` | `5` | Batch download concurrency cap |
 | `CAMOFOX_MAX_BLOB_SIZE_MB` | `5` | Max blob payload size |
 | `CAMOFOX_MAX_DOWNLOADS_PER_USER` | `500` | Per-user download record cap |
+| `CAMOFOX_CONSOLE_BUFFER_SIZE` | `1000` | Per-tab console/error message buffer size (minimum `100`) |
 | `HANDLER_TIMEOUT_MS` | `30000` | Handler timeout fallback |
 | `MAX_CONCURRENT_PER_USER` | `3` | Concurrent operations per user |
 | `CAMOFOX_VNC_BASE_PORT` | `6080` | noVNC/websockify base port |
 | `CAMOFOX_VNC_HOST` | `localhost` | noVNC host in returned URL |
 | `CAMOFOX_CLI_USER` | `cli-default` | Default CLI user id |
-| `CAMOFOX_IDLE_TIMEOUT_MS` | `1800000` | CLI server idle timeout |
+| `CAMOFOX_SERVER_PID_FILE` | (unset) | Optional daemon PID file path used by the CLI server manager |
+| `CAMOFOX_IDLE_TIMEOUT_MS` | `1800000` | Stage 1 idle cleanup threshold (ms) |
+| `CAMOFOX_IDLE_EXIT_TIMEOUT_MS` | `1800000` | Stage 2 daemon exit quiet window (ms, defaults to match Stage 1) |
 | `CAMOFOX_PRESETS_FILE` | (unset) | Optional JSON file defining/overriding geo presets |
+| `CAMOFOX_PROXY_PROFILES_FILE` | (unset) | Optional JSON file defining named proxy profiles for session-level overrides |
 | `CAMOFOX_SESSION_TIMEOUT` | `1800000` | Session idle timeout in ms (min `60000`) |
 | `CAMOFOX_MAX_SESSIONS` | `50` | Maximum concurrent sessions |
 | `CAMOFOX_MAX_TABS` | `10` | Maximum tabs per session |
-| `PROXY_HOST` | (empty) | Proxy host (enables proxy routing) |
-| `PROXY_PORT` | (empty) | Proxy port |
-| `PROXY_USERNAME` | (empty) | Proxy username |
-| `PROXY_PASSWORD` | (empty) | Proxy password |
+| `PROXY_HOST` | (empty) | Proxy host (server-level default; enables proxy routing) |
+| `PROXY_PORT` | (empty) | Proxy port (server-level default) |
+| `PROXY_USERNAME` | (empty) | Proxy username (server-level default) |
+| `PROXY_PASSWORD` | (empty) | Proxy password (server-level default) |
 | `CAMOFOX_MAX_SNAPSHOT_CHARS` | `80000` | Max characters in snapshot before truncation |
+| `CAMOFOX_MAX_SNAPSHOT_NODES` | `2000` | Max accessibility snapshot nodes before truncation |
 | `CAMOFOX_SNAPSHOT_TAIL_CHARS` | `5000` | Characters preserved at end of truncated snapshot |
 | `CAMOFOX_BUILDREFS_TIMEOUT_MS` | `12000` | Timeout for building element refs |
 | `CAMOFOX_TAB_LOCK_TIMEOUT_MS` | `30000` | Timeout for acquiring tab lock |
+| `CAMOFOX_TRACES_DIR` | `~/.camofox/traces` | Managed Playwright trace artifact directory |
+| `CAMOFOX_TRACE_MAX_DURATION_MS` | `300000` | Maximum trace recording duration before automatic stop |
 | `CAMOFOX_HEALTH_PROBE_INTERVAL_MS` | `60000` | Health probe check interval |
 | `CAMOFOX_FAILURE_THRESHOLD` | `3` | Consecutive failures before health degradation |
 | `CAMOFOX_YT_DLP_TIMEOUT_MS` | `30000` | Timeout for yt-dlp subtitle extraction |
 | `CAMOFOX_YT_BROWSER_TIMEOUT_MS` | `25000` | Timeout for browser transcript fallback |
+| `CAMOFOX_OS` | (unset) | Optional server-wide Camoufox OS override (`windows`, `macos`, `linux`, or comma-separated list for randomization) |
+| `CAMOFOX_ALLOW_WEBGL` | (unset) | Optional server-wide WebGL override; malformed values fail startup |
+| `CAMOFOX_SCREEN_WIDTH` | (unset) | Optional screen width override; applied only with `CAMOFOX_SCREEN_HEIGHT` |
+| `CAMOFOX_SCREEN_HEIGHT` | (unset) | Optional screen height override; applied only with `CAMOFOX_SCREEN_WIDTH` |
+| `CAMOFOX_HUMANIZE` | (unset) | Optional server-wide humanization override |
+
+> `CAMOFOX_OS` and `CAMOFOX_SCREEN_*` are **generation-time** controls: they affect only newly generated fingerprints and have no effect while an existing `fingerprint.json` sidecar is in use. Reset the profile or delete `fingerprint.json` to force regeneration under the new defaults. `CAMOFOX_ALLOW_WEBGL` and `CAMOFOX_HUMANIZE` are **launch-time** overrides and apply on every browser launch regardless of whether a sidecar is reused.
+
+### Idle Lifecycle Policy
+
+CamoFox implements a two-stage idle lifecycle for graceful cleanup and daemon exit:
+
+**Stage 1 — Idle Cleanup**
+- After `CAMOFOX_IDLE_TIMEOUT_MS` of idle time (default: 30 minutes), the server runs cleanup to close idle sessions and tabs
+- Cleanup is delayed if browser contexts are launching or sessions are being created
+- New interactive activity (tab creation, navigation, interaction) cancels any pending cleanup
+
+**Stage 2 — Daemon Exit**
+- After Stage 1 cleanup completes, the server waits for `CAMOFOX_IDLE_EXIT_TIMEOUT_MS` (default: matches Stage 1 timeout)
+- If no new activity occurs during this quiet window, the daemon process exits gracefully
+- Any new request activity cancels the pending exit timer
+
+**Activity detection**:
+- Live tabs, launching browser contexts, or staged session creation count as active work and prevent cleanup
+- Empty sessions (sessions with no tabs) do not block cleanup but do disarm pending daemon exit
+- New interactive activity resets both cleanup and exit timers
+
+This two-stage model ensures cleanup runs before daemon exit, preventing resource leaks while allowing the server to shut down cleanly when fully idle.
 
 ## Deployment
 
@@ -644,9 +918,27 @@ Custom presets: set `CAMOFOX_PRESETS_FILE=/path/to/presets.json` (JSON object; k
 docker build -t camofox-browser .
 docker run -p 9377:9377 -p 6080:6080 \
   -v ~/.camofox:/home/node/.camofox \
+  -e CAMOFOX_HOST=0.0.0.0 \
   -e CAMOFOX_PORT=9377 \
+  -e CAMOFOX_AUTH_MODE=auto \
+  -e CAMOFOX_API_KEY=change-me \
   camofox-browser
 ```
+
+For private Docker networks used by agents such as Hermes, OpenClaw, or GoClaw that cannot send a bearer token, keep the service off published host ports and disable API-key auth explicitly:
+
+```bash
+docker network create camofox-agents
+docker run -d \
+  --name camofox-browser \
+  --network camofox-agents \
+  -e CAMOFOX_HOST=0.0.0.0 \
+  -e CAMOFOX_AUTH_MODE=disabled \
+  -v ~/.camofox:/home/node/.camofox \
+  camofox-browser
+```
+
+Then configure the agent with `CAMOFOX_URL=http://camofox-browser:9377` from another container on the same Docker network. Do not combine `CAMOFOX_AUTH_MODE=disabled` with public port publishing or `CAMOFOX_ALLOW_PRIVATE_NETWORK=true`.
 
 ### Fly.io
 
@@ -660,6 +952,8 @@ fly deploy
 ### Railway
 
 - Create a new project → deploy from this GitHub repo
+- Set `CAMOFOX_HOST=0.0.0.0`
+- Set `CAMOFOX_API_KEY` to a strong secret
 - Set `CAMOFOX_PORT=9377` (Railway will also provide `PORT`, which is supported)
 - Ensure the service exposes port `9377`
 
@@ -667,6 +961,8 @@ fly deploy
 
 - Create a new Web Service → deploy from this GitHub repo
 - Use Docker (recommended) and expose port `9377`
+- Set `CAMOFOX_HOST=0.0.0.0`
+- Set `CAMOFOX_API_KEY` to a strong secret
 - Set `CAMOFOX_PORT=9377` (or rely on Render `PORT`)
 
 ### System Requirements

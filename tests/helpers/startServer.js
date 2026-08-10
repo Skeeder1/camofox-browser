@@ -4,6 +4,15 @@ const { loadConfig } = require('../../dist/src/utils/config');
 
 let serverProcess = null;
 let serverPort = null;
+let serverLogs = [];
+
+function appendServerLog(msg) {
+  const lines = String(msg)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  serverLogs.push(...lines);
+}
 
 async function waitForServer(port, maxRetries = 30, interval = 1000) {
   for (let i = 0; i < maxRetries; i++) {
@@ -23,10 +32,17 @@ async function waitForServer(port, maxRetries = 30, interval = 1000) {
 async function startServer(port = 0, extraEnv = {}) {
   const cfg = loadConfig();
   const pluginDir = path.join(__dirname, '../..');
+  serverLogs = [];
 
   const log = {
-    info: (msg) => { if (process.env.DEBUG_SERVER) console.log(msg); },
-    error: (msg) => { if (process.env.DEBUG_SERVER) console.error(msg); },
+    info: (msg) => {
+      appendServerLog(msg);
+      if (process.env.DEBUG_SERVER) console.log(msg);
+    },
+    error: (msg) => {
+      appendServerLog(msg);
+      if (process.env.DEBUG_SERVER) console.error(msg);
+    },
   };
 
   const maxStartAttempts = 5;
@@ -71,6 +87,13 @@ async function startServer(port = 0, extraEnv = {}) {
 
 async function stopServer() {
   if (serverProcess) {
+    // If process has already exited, clean up and return immediately
+    if (serverProcess.exitCode !== null || serverProcess.killed) {
+      serverProcess = null;
+      serverPort = null;
+      return;
+    }
+
     return new Promise((resolve) => {
       const killTimer = setTimeout(() => {
         if (serverProcess) {
@@ -99,9 +122,19 @@ function getServerPort() {
   return serverPort;
 }
 
+function getServerLogs() {
+  return [...serverLogs];
+}
+
+function clearServerLogs() {
+  serverLogs = [];
+}
+
 module.exports = {
   startServer,
   stopServer,
   getServerUrl,
-  getServerPort
+  getServerPort,
+  getServerLogs,
+  clearServerLogs
 };

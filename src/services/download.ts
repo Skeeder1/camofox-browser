@@ -7,12 +7,16 @@ import type { Download, Page } from 'playwright-core';
 import type { DownloadInfo, DownloadListFilters } from '../types';
 import { loadConfig } from '../utils/config';
 import { guessMimeType, normalizeExtensions, safeUserDir, sanitizeFilename } from '../utils/download-helpers';
+import { readVersionedSidecar, writeVersionedSidecar } from '../utils/sidecar-version';
 import { log } from '../middleware/logging';
 
 const CONFIG = loadConfig();
 
 // In-memory registry of downloads (persisted to disk)
 const downloads = new Map<string, DownloadInfo>();
+
+// Tab IDs with staged (uncommitted) downloads - hidden from external queries.
+const stagedTabIds = new Set<string>();
 
 const REGISTRY_FILE = path.join(CONFIG.downloadsDir, 'registry.json');
 
@@ -22,6 +26,14 @@ let registryInitialized = false;
 let cleanupInterval: NodeJS.Timeout | null = null;
 
 const pagesWithListener = new WeakSet<Page>();
+
+export function markDownloadsStaged(tabId: string): void {
+	stagedTabIds.add(String(tabId));
+}
+
+export function commitStagedDownloads(tabId: string): void {
+	stagedTabIds.delete(String(tabId));
+}
 
 export function buildContentUrl(id: string, userId: string): string {
 	return `/downloads/${String(id)}/content?userId=${encodeURIComponent(String(userId))}`;
@@ -58,10 +70,7 @@ function saveRegistryToDisk(): void {
 			normalizeDownloadInfo(info);
 			obj[String(id)] = info;
 		}
-
-		const tmp = `${REGISTRY_FILE}.tmp`;
-		fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
-		fs.renameSync(tmp, REGISTRY_FILE);
+		writeVersionedSidecar(REGISTRY_FILE, 1, obj);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		log('warn', 'download registry save failed', { error: message });
@@ -81,81 +90,90 @@ function scheduleSaveRegistry(): void {
 function loadRegistryFromDisk(): { loaded: number; removed: number } {
 	let loaded = 0;
 	let removed = 0;
-	try {
-		if (!fs.existsSync(REGISTRY_FILE)) return { loaded: 0, removed: 0 };
-		const raw = fs.readFileSync(REGISTRY_FILE, 'utf-8');
-		const parsed = JSON.parse(raw) as unknown;
-		if (!parsed || typeof parsed !== 'object') return { loaded: 0, removed: 0 };
-		const record = parsed as Record<string, unknown>;
-
-		for (const [idKey, value] of Object.entries(record)) {
-			if (!value || typeof value !== 'object') {
-				removed++;
-				continue;
-			}
-			const anyInfo = value as Record<string, unknown>;
-			const id = String(anyInfo.id ?? idKey);
-			const userId = String(anyInfo.userId ?? '');
-			const savedFilename = String(anyInfo.savedFilename ?? '');
-			if (!id || !userId || !savedFilename) {
-				removed++;
-				continue;
-			}
-
-			const filePath = path.join(safeUserDir(CONFIG.downloadsDir, userId), savedFilename);
-			if (!fs.existsSync(filePath)) {
-				removed++;
-				continue;
-			}
-
-			let statSize = -1;
-			let statMtime = Date.now();
-			try {
-				const stat = fs.statSync(filePath);
-				statSize = stat.size;
-				statMtime = typeof stat.mtimeMs === 'number' ? stat.mtimeMs : Date.now();
-			} catch {
-				// ignore
-			}
-
-			const suggested = String(anyInfo.suggestedFilename ?? savedFilename.replace(/^([0-9a-f-]{36})_/, '')) || 'download';
-			const mimeType = String(anyInfo.mimeType ?? guessMimeType(suggested));
-			const size = typeof anyInfo.size === 'number' && Number.isFinite(anyInfo.size) ? (anyInfo.size as number) : statSize;
-			const createdAt =
-				typeof anyInfo.createdAt === 'number' && Number.isFinite(anyInfo.createdAt) ? (anyInfo.createdAt as number) : statMtime;
-			const completedAt =
-				typeof anyInfo.completedAt === 'number' && Number.isFinite(anyInfo.completedAt) ? (anyInfo.completedAt as number) : statMtime;
-			const statusRaw = String(anyInfo.status ?? 'completed');
-			const status = (['pending', 'completed', 'failed', 'canceled'] as const).includes(statusRaw as any)
-				? (statusRaw as DownloadInfo['status'])
-				: 'completed';
-			const error = typeof anyInfo.error === 'string' ? (anyInfo.error as string) : undefined;
-			const url = typeof anyInfo.url === 'string' ? (anyInfo.url as string) : '';
-			const tabId = typeof anyInfo.tabId === 'string' ? (anyInfo.tabId as string) : 'unknown';
-
-			const info: DownloadInfo = {
-				id,
-				contentUrl: buildContentUrl(id, userId),
-				tabId,
-				userId,
-				suggestedFilename: suggested,
-				savedFilename,
-				mimeType,
-				size,
-				status,
-				error,
-				url,
-				createdAt,
-				completedAt,
-			};
-			normalizeDownloadInfo(info);
-			downloads.set(String(info.id), info);
-			loaded++;
+	const result = readVersionedSidecar<Record<string, unknown>>(REGISTRY_FILE, {
+		currentVersion: 1,
+		migrations: {
+			0: (raw) => raw as Record<string, unknown>,
+		},
+		label: 'download registry',
+	});
+	if (result === null) {
+		if (fs.existsSync(REGISTRY_FILE)) {
+			throw new Error(
+				`Download registry at ${REGISTRY_FILE} has invalid payload (null or missing data section). Delete the file to reset.`,
+			);
 		}
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		log('warn', 'download registry load failed', { error: message });
 		return { loaded: 0, removed: 0 };
+	}
+	if (typeof result !== 'object' || Array.isArray(result)) {
+		throw new Error(
+			`Download registry at ${REGISTRY_FILE} has invalid payload shape (expected object map). Delete the file to reset.`,
+		);
+	}
+
+	for (const [idKey, value] of Object.entries(result)) {
+		if (!value || typeof value !== 'object') {
+			removed++;
+			continue;
+		}
+		const anyInfo = value as Record<string, unknown>;
+		const id = String(anyInfo.id ?? idKey);
+		const userId = String(anyInfo.userId ?? '');
+		const savedFilename = String(anyInfo.savedFilename ?? '');
+		if (!id || !userId || !savedFilename) {
+			removed++;
+			continue;
+		}
+
+		const filePath = path.join(safeUserDir(CONFIG.downloadsDir, userId), savedFilename);
+		if (!fs.existsSync(filePath)) {
+			removed++;
+			continue;
+		}
+
+		let statSize = -1;
+		let statMtime = Date.now();
+		try {
+			const stat = fs.statSync(filePath);
+			statSize = stat.size;
+			statMtime = typeof stat.mtimeMs === 'number' ? stat.mtimeMs : Date.now();
+		} catch {
+			// ignore
+		}
+
+		const suggested = String(anyInfo.suggestedFilename ?? savedFilename.replace(/^([0-9a-f-]{36})_/, '')) || 'download';
+		const mimeType = String(anyInfo.mimeType ?? guessMimeType(suggested));
+		const size = typeof anyInfo.size === 'number' && Number.isFinite(anyInfo.size) ? (anyInfo.size as number) : statSize;
+		const createdAt =
+			typeof anyInfo.createdAt === 'number' && Number.isFinite(anyInfo.createdAt) ? (anyInfo.createdAt as number) : statMtime;
+		const completedAt =
+			typeof anyInfo.completedAt === 'number' && Number.isFinite(anyInfo.completedAt) ? (anyInfo.completedAt as number) : statMtime;
+		const statusRaw = String(anyInfo.status ?? 'completed');
+		const status = (['pending', 'completed', 'failed', 'canceled'] as const).includes(statusRaw as any)
+			? (statusRaw as DownloadInfo['status'])
+			: 'completed';
+		const error = typeof anyInfo.error === 'string' ? (anyInfo.error as string) : undefined;
+		const url = typeof anyInfo.url === 'string' ? (anyInfo.url as string) : '';
+		const tabId = typeof anyInfo.tabId === 'string' ? (anyInfo.tabId as string) : 'unknown';
+
+		const info: DownloadInfo = {
+			id,
+			contentUrl: buildContentUrl(id, userId),
+			tabId,
+			userId,
+			suggestedFilename: suggested,
+			savedFilename,
+			mimeType,
+			size,
+			status,
+			error,
+			url,
+			createdAt,
+			completedAt,
+		};
+		normalizeDownloadInfo(info);
+		downloads.set(String(info.id), info);
+		loaded++;
 	}
 	return { loaded, removed };
 }
@@ -223,12 +241,25 @@ function initializeRegistry(): void {
 	if (registryInitialized) return;
 	registryInitialized = true;
 
-	const { loaded, removed } = loadRegistryFromDisk();
-	const added = scanOrphanedFiles();
-	if (loaded || removed || added) {
-		log('info', 'download registry initialized', { loaded, removed, added });
-		// Persist cleaned/rebuilt registry immediately.
-		saveRegistryToDisk();
+	let loaded = 0;
+	let removed = 0;
+	let registryCorrupt = false;
+	try {
+		({ loaded, removed } = loadRegistryFromDisk());
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		log('error', 'download registry load failed; existing downloads unavailable until registry is fixed or deleted', {
+			error: message,
+			registryFile: REGISTRY_FILE,
+		});
+		registryCorrupt = true;
+	}
+	if (!registryCorrupt) {
+		const added = scanOrphanedFiles();
+		if (loaded || removed || added) {
+			log('info', 'download registry initialized', { loaded, removed, added });
+			saveRegistryToDisk();
+		}
 	}
 }
 
@@ -398,6 +429,7 @@ function deleteDownloadEntry(id: string, info: DownloadInfo): void {
 }
 
 function matchFilters(info: DownloadInfo, filters: DownloadListFilters): boolean {
+	if (stagedTabIds.has(String(info.tabId))) return false;
 	if (String(info.userId) !== String(filters.userId)) return false;
 	if (filters.tabId && String(info.tabId) !== String(filters.tabId)) return false;
 	if (filters.status && String(info.status) !== String(filters.status)) return false;
@@ -455,6 +487,7 @@ export function getDownload(id: string, userId: string): DownloadInfo | null {
 	const info = downloads.get(String(id));
 	if (!info) return null;
 	if (String(info.userId) !== String(userId)) return null;
+	if (stagedTabIds.has(String(info.tabId))) return null;
 	return info;
 }
 
@@ -489,7 +522,9 @@ export function deleteDownload(id: string, userId: string): boolean {
 
 export function getRecentDownloads(tabId: string, windowMs: number): DownloadInfo[] {
 	const now = Date.now();
-	return Array.from(downloads.values()).filter((d) => d.tabId === String(tabId) && now - d.createdAt <= windowMs);
+	return Array.from(downloads.values()).filter(
+		(d) => d.tabId === String(tabId) && now - d.createdAt <= windowMs && !stagedTabIds.has(String(d.tabId)),
+	);
 }
 
 export function cleanupExpiredDownloads(ttlMs: number): number {
@@ -518,6 +553,7 @@ export function cleanupUserDownloads(userId: string): number {
 	let removed = 0;
 	for (const [id, info] of downloads) {
 		if (String(info.userId) !== uid) continue;
+		stagedTabIds.delete(String(info.tabId));
 		const filePath = path.join(safeUserDir(CONFIG.downloadsDir, uid), info.savedFilename);
 		try {
 			fs.unlinkSync(filePath);

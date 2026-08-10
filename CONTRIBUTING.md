@@ -52,3 +52,38 @@ spawn('node', [serverPath], {
 If the child process needs a new env var, add it to the whitelist explicitly (do not broaden the whitelist).
 
 **Do not use `dotenv` or load `.env` files.** The server reads configuration from explicitly passed environment variables only.
+
+## Preview Compatibility Rules
+
+CamoFox is in Preview (Phase 1). These rules apply to all contributions during this period.
+
+### Adding New Endpoints or Commands
+- New endpoints and CLI commands may be added freely
+- Document them in CHANGELOG.md under the appropriate version
+
+### Renaming or Moving Endpoints
+- Maintain the old path as an alias that routes to the new implementation
+- Mark the alias as deprecated in code comments and CHANGELOG
+- Do NOT remove the alias until GA or a documented migration window
+
+### Renaming Request/Response Fields
+- Accept both old and new field names in request bodies
+- Emit only the new field name in responses
+- Document the rename in CHANGELOG
+
+### Local State Format Changes
+- Use the versioned sidecar pattern (`readVersionedSidecar` / `writeVersionedSidecar` from `src/utils/sidecar-version.ts`)
+- Add a read path for the previous version format
+- Fail closed on unknown, corrupt, or newer-than-expected state — log an actionable error, never silently regenerate or auto-migrate
+
+## Release Gate Checklist
+
+Before tagging a release, verify each item against the current codebase — not prior documentation:
+
+- [ ] Every feature claim in README matches shipped, tested behavior
+- [ ] CLI command count and search macro count match registered implementations
+- [ ] Environment variable table in README matches actual code defaults in `src/utils/config.ts`
+- [ ] CHANGELOG entry covers all changes since the last tag
+- [ ] No unshipped or experimental features are described as stable
+- [ ] Local state format changes (if any) include versioned read paths and are documented in CHANGELOG
+- [ ] Breaking changes (if any) include recovery instructions in CHANGELOG and RELEASE_NOTES

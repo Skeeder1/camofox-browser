@@ -4,16 +4,23 @@ import express from 'express';
 
 import coreRoutes from './routes/core';
 import openclawRoutes from './routes/openclaw';
+import docsRoutes from './routes/docs';
 import { installCrashHandlers, safeError } from './middleware/errors';
 import { loggingMiddleware, log, startStatsBeacon } from './middleware/logging';
-import { loadConfig } from './utils/config';
+import { createLifecycleActivityMiddleware } from './middleware/lifecycle-activity';
+import { assertServerExposureSafety, loadConfig } from './utils/config';
+import { closeBrowser } from './services/browser';
 import { contextPool } from './services/context-pool';
+import { lifecycleController } from './services/lifecycle-controller';
 import {
 	closeAllSessions,
 	countTotalTabsForSessions,
 	getAllSessions,
 	startCleanupInterval as startSessionCleanupInterval,
 	stopCleanupInterval as stopSessionCleanupInterval,
+	runLifecycleIdleCleanup,
+	getLifecycleSessionSnapshot,
+	getSessionsSnapshot,
 } from './services/session';
 import {
 	startCleanupInterval as startDownloadCleanupInterval,
@@ -24,26 +31,20 @@ import { detectYtDlp } from './services/youtube';
 import { stopAllVnc } from './services/vnc';
 
 const CONFIG = loadConfig();
+assertServerExposureSafety(CONFIG);
 
 const app = express();
-// 5mb: profile save/load payloads (cookie-jar JSON) can exceed 100kb once a
-// session accumulates third-party/tracking cookies (e.g. 174KB observed for a
-// long-lived LeBonCoin session) — the old 100kb limit made load_profile fail
-// with "request entity too large" and forced a fallback to a stale profile.
+// 5mb: profile save/load payloads (cookie-jar JSON) exceed 100kb once a
+// session accumulates third-party cookies (174KB observed on a long-lived
+// LeBonCoin session). At 100kb load_profile failed with "request entity too
+// large" and silently fell back to a stale profile.
 app.use(express.json({ limit: '5mb' }));
 app.use(loggingMiddleware);
-
-// Track last activity time for idle shutdown (updated on every non-health request)
-let lastActivityAt = Date.now();
-app.use((req, _res, next) => {
-	if (req.path !== '/health' && req.path !== '/') {
-		lastActivityAt = Date.now();
-	}
-	next();
-});
+app.use(createLifecycleActivityMiddleware(lifecycleController));
 
 app.use(coreRoutes);
 app.use(openclawRoutes);
+app.use(docsRoutes);
 
 // Fallback error middleware (routes largely handle their own errors to preserve legacy behavior)
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
@@ -67,13 +68,23 @@ startStatsBeacon(() => {
 const PORT = CONFIG.port;
 let server: Server;
 let healthProbeInterval: NodeJS.Timeout | null = null;
-let idleShutdownInterval: NodeJS.Timeout | null = null;
 
 void detectYtDlp((message: unknown) => {
 	log('info', 'yt-dlp detection', { message: String(message) });
 });
 
 let shuttingDown = false;
+
+async function cleanupDaemonPidFileFromEnv(): Promise<void> {
+	const pidFile = process.env.CAMOFOX_SERVER_PID_FILE;
+	if (!pidFile) return;
+	try {
+		await require('node:fs/promises').rm(pidFile, { force: true });
+	} catch {
+		// Ignore cleanup errors
+	}
+}
+
 async function gracefulShutdown(signal: string): Promise<void> {
 	if (shuttingDown) return;
 	shuttingDown = true;
@@ -92,11 +103,6 @@ async function gracefulShutdown(signal: string): Promise<void> {
 		// ignore
 	}
 
-	if (idleShutdownInterval) {
-		clearInterval(idleShutdownInterval);
-		idleShutdownInterval = null;
-	}
-
 	await closeAllSessions().catch(() => {});
 	stopAllVnc();
 	stopSessionCleanupInterval();
@@ -105,14 +111,16 @@ async function gracefulShutdown(signal: string): Promise<void> {
 		clearInterval(healthProbeInterval);
 		healthProbeInterval = null;
 	}
+	await closeBrowser().catch(() => {});
+	await cleanupDaemonPidFileFromEnv();
 	process.exit(0);
 }
 
 process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
 
-server = app.listen(PORT, () => {
-	log('info', 'server started', { port: PORT, pid: process.pid, nodeVersion: process.version });
+server = app.listen(PORT, CONFIG.host, () => {
+	log('info', 'server started', { port: PORT, host: CONFIG.host, pid: process.pid, nodeVersion: process.version });
 	log('info', 'using persistent profiles', { profilesDir: CONFIG.profilesDir });
 	resetHealth();
 	healthProbeInterval = setInterval(() => {
@@ -129,20 +137,47 @@ server = app.listen(PORT, () => {
 	}, CONFIG.healthProbeIntervalMs);
 	healthProbeInterval.unref();
 
-	// Idle shutdown: exit if no activity for CAMOFOX_IDLE_TIMEOUT_MS (default 15min)
-	if (CONFIG.idleTimeoutMs > 0) {
-		idleShutdownInterval = setInterval(() => {
-			const idle = Date.now() - lastActivityAt;
-			if (idle >= CONFIG.idleTimeoutMs) {
-				log('info', 'idle timeout reached, shutting down', { idleMs: idle, limitMs: CONFIG.idleTimeoutMs });
-				void gracefulShutdown('IDLE_TIMEOUT');
+	// Lifecycle idle cleanup check
+	setInterval(async () => {
+		const now = Date.now();
+		const sessionSnapshot = getLifecycleSessionSnapshot();
+		const contextSnapshot = contextPool.getLifecycleSnapshot();
+		lifecycleController.syncLiveState({
+			liveSessions: sessionSnapshot.liveSessions,
+			liveTabs: sessionSnapshot.liveTabs,
+			launchingContexts: contextSnapshot.launchingContexts,
+			stagedCreates: sessionSnapshot.stagedCreates,
+		});
+
+		// Stage 2: check for idle exit after successful cleanup
+		if (lifecycleController.shouldExit(now)) {
+			log('info', 'idle exit started');
+			await gracefulShutdown('IDLE_TIMEOUT');
+			return;
+		}
+
+		if (lifecycleController.shouldRunCleanup(now)) {
+			lifecycleController.markCleanupStarted(now);
+			// Snapshot sessions and contexts atomically BEFORE async cleanup work
+			const sessionsToCheck = getSessionsSnapshot();
+			const contextsToCheck = contextPool.getPoolEntries();
+			try {
+				const result = await runLifecycleIdleCleanup(sessionsToCheck, contextsToCheck, now);
+				lifecycleController.markCleanupFinished('success', Date.now());
+				log('info', 'idle cleanup completed', result);
+			} catch (error) {
+				lifecycleController.markCleanupFinished('failed', Date.now());
+				log('error', 'idle cleanup failed', { error: safeError(error) });
 			}
-		}, 60_000);
-		idleShutdownInterval.unref();
-	}
-	if (!CONFIG.apiKey) {
-		console.warn('[camofox] ⚠️  CAMOFOX_API_KEY not set — all endpoints are open without authentication.');
-		console.warn('[camofox] Set CAMOFOX_API_KEY for production/network-exposed deployments.');
+		}
+	}, 250);
+
+	if (CONFIG.authMode === 'disabled') {
+		console.warn('[camofox] ⚠️  CAMOFOX_AUTH_MODE=disabled — API key authentication is disabled for all protected endpoints.');
+		console.warn('[camofox] Only use disabled auth mode on trusted private networks; do not publish this server to untrusted networks.');
+	} else if (!CONFIG.apiKey) {
+		console.warn('[camofox] ⚠️  CAMOFOX_API_KEY not set — protected endpoints are only intended for loopback-only deployments.');
+		console.warn('[camofox] Set CAMOFOX_API_KEY before binding CAMOFOX_HOST beyond localhost.');
 	}
 });
 

@@ -31,6 +31,37 @@ function createTestApp() {
       </body></html>
     `);
   });
+
+  app.get('/long-snapshot', (req, res) => {
+    const sections = Array.from({ length: 500 }, (_, index) => (
+      `<p>Section ${index + 1}: ${'Long snapshot content for pagination coverage. '.repeat(6)}</p>`
+    )).join('');
+
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Long Snapshot</title></head>
+      <body>
+        <h1>Long Snapshot Page</h1>
+        ${sections}
+        <a href="/pageA">Return to Page A</a>
+      </body></html>
+    `);
+  });
+
+  app.get('/slow', (req, res) => {
+    const parsedDelay = Number.parseInt(String(req.query.delay || '1000'), 10);
+    const delay = Number.isFinite(parsedDelay) && parsedDelay >= 0 ? parsedDelay : 1000;
+    setTimeout(() => {
+      res.send(`
+        <!DOCTYPE html>
+        <html><head><title>Slow Page</title></head>
+        <body>
+          <h1>Slow Page</h1>
+          <p id="delay">Delay: ${delay}</p>
+        </body></html>
+      `);
+    }, delay);
+  });
   
   // Page with multiple links for links extraction test
   app.get('/links', (req, res) => {
@@ -170,6 +201,27 @@ function createTestApp() {
       </body></html>
     `);
   });
+
+  app.get('/select-redirect', (_req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Select Redirect</title></head>
+      <body>
+        <h1>Select Redirect Test</h1>
+        <select id="target-select">
+          <option value="">Choose</option>
+          <option value="http://169.254.169.254/latest/meta-data">Metadata</option>
+        </select>
+        <script>
+          document.getElementById('target-select').addEventListener('change', (event) => {
+            if (event.target.value) {
+              window.location.href = event.target.value;
+            }
+          });
+        </script>
+      </body></html>
+    `);
+  });
   
   // Echo endpoint for macro expansion testing - echoes the full request URL
   app.get('/echo-url', (req, res) => {
@@ -196,6 +248,141 @@ function createTestApp() {
         <div id="bottom">Bottom of page</div>
       </body></html>
     `);
+  });
+
+  // Page with horizontally scrollable content
+  app.get('/scroll-horizontal', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Horizontal Scroll Test</title></head>
+      <body>
+        <div id="container" style="width: 300px; height: 300px; overflow: auto;">
+          <div id="wide-content" style="width: 5000px; height: 5000px;">
+            <span id="origin">Origin</span>
+            <span id="far-right" style="position: absolute; left: 4500px; top: 10px;">Far Right</span>
+          </div>
+        </div>
+        <div id="scroll-info"></div>
+        <script>
+          const c = document.getElementById('container');
+          document.getElementById('scroll-info').textContent = 'scrollLeft:' + c.scrollLeft + ' scrollTop:' + c.scrollTop;
+          c.addEventListener('scroll', () => {
+            document.getElementById('scroll-info').textContent = 'scrollLeft:' + c.scrollLeft + ' scrollTop:' + c.scrollTop;
+          });
+        </script>
+      </body></html>
+    `);
+  });
+
+  const pngPixel = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO0pQ4sAAAAASUVORK5CYII=',
+    'base64',
+  );
+
+  app.get('/assets/:filename', (req, res) => {
+    const name = String(req.params.filename || '');
+    if (name === 'hero.png' || name === 'lazy.png') {
+      res.set('Content-Type', 'image/png');
+      return res.send(pngPixel);
+    }
+    return res.status(404).send('Not found');
+  });
+
+  app.get('/images', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+        <head><title>Images Page</title></head>
+        <body>
+          <main id="gallery">
+            <img id="hero-image" src="/assets/hero.png" alt="Hero image" width="32" height="24" />
+            <img
+              id="inline-image"
+              src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+              alt="Inline image"
+              width="1"
+              height="1"
+            />
+            <img id="blob-image" alt="Blob image" width="8" height="8" />
+            <img id="lazy-image" src="/assets/lazy.png" loading="lazy" alt="Lazy image" width="20" height="20" />
+          </main>
+          <script>
+            const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#ff3366"/></svg>';
+            const blob = new Blob([svg], { type: 'image/svg+xml' });
+            document.getElementById('blob-image').src = URL.createObjectURL(blob);
+          </script>
+        </body>
+      </html>
+    `);
+  });
+
+  app.get('/structured-products', (_req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+        <head><title>Structured Products</title></head>
+        <body>
+          <main id="catalog">
+            <h1>Catalog</h1>
+            <article class="product">
+              <h2 class="name">Red Mug</h2>
+              <p class="price">19.99</p>
+              <a class="product-link" href="/products/red-mug">View product</a>
+              <section class="seller">
+                <span class="seller-name">North Shop</span>
+              </section>
+              <ul>
+                <li class="badge">Hot</li>
+                <li class="badge">Ceramic</li>
+              </ul>
+            </article>
+            <article class="product">
+              <h2 class="name">Blue Plate</h2>
+              <p class="price">24.5</p>
+              <a class="product-link" href="/products/blue-plate">View product</a>
+              <section class="seller">
+                <span class="seller-name">South Shop</span>
+              </section>
+              <ul>
+                <li class="badge">New</li>
+              </ul>
+            </article>
+          </main>
+        </body>
+      </html>
+    `);
+  });
+
+  app.get('/structured-missing-price', (_req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+        <head><title>Structured Missing Price</title></head>
+        <body>
+          <main id="catalog">
+            <h1>Catalog</h1>
+            <article class="product">
+              <h2 class="name">Red Mug</h2>
+              <p class="price">19.99</p>
+            </article>
+            <article class="product">
+              <h2 class="name">Blue Plate</h2>
+            </article>
+          </main>
+        </body>
+      </html>
+    `);
+  });
+
+  // Native download fixture for download-listener tests
+  app.get('/download-file', (req, res) => {
+    const content = Buffer.from('camofox-test-download-content');
+    res.set({
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': 'attachment; filename="test-download.bin"',
+      'Content-Length': String(content.length),
+    });
+    res.send(content);
   });
   
   return app;

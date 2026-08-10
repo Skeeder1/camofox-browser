@@ -1,7 +1,12 @@
-import type { Locator, Page } from 'playwright-core';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
+
+import type { BrowserContext, Locator, Page } from 'playwright-core';
 
 import { isElementRef as isSelectorElementRef } from '../cli/utils/selector';
 import { expandMacro } from '../utils/macros';
+import { loadConfig } from '../utils/config';
+import { windowSnapshot } from '../utils/snapshot';
 import type {
 	ConsoleEntry,
 	EvaluateResult,
@@ -13,7 +18,17 @@ import type {
 } from '../types';
 import { log } from '../middleware/logging';
 
+// Click timeout. Playwright's 5s default is too tight on SPA sites where the
+// target is still hydrating: the click times out, falls through to the mouse
+// sequence, and the extra round trip is what actually made clicks flaky.
+// Override with CAMOFOX_CLICK_TIMEOUT_MS.
+const CLICK_TIMEOUT_MS = Number(process.env.CAMOFOX_CLICK_TIMEOUT_MS) > 0
+	? Number(process.env.CAMOFOX_CLICK_TIMEOUT_MS)
+	: 20_000;
+
 const ALLOWED_URL_SCHEMES: ReadonlyArray<'http:' | 'https:'> = ['http:', 'https:'];
+const CONFIG = loadConfig();
+const METADATA_HOSTNAMES = new Set(['metadata.google.internal']);
 
 // Selective set of actionable roles worth indexing as refs.
 const INTERACTIVE_ROLES: ReadonlyArray<string> = [
@@ -41,21 +56,37 @@ const INTERACTIVE_ROLES: ReadonlyArray<string> = [
 // Patterns to skip (date pickers, calendar widgets)
 const SKIP_PATTERNS: ReadonlyArray<RegExp> = [/date/i, /calendar/i, /picker/i, /datepicker/i];
 
-const DEFAULT_MAX_SNAPSHOT_NODES = 2000;
-const parsedMaxSnapshotNodes = Number.parseInt(
-	process.env.CAMOFOX_MAX_SNAPSHOT_NODES || String(DEFAULT_MAX_SNAPSHOT_NODES),
-	10,
-);
-const MAX_SNAPSHOT_NODES = Number.isFinite(parsedMaxSnapshotNodes) && parsedMaxSnapshotNodes > 0
-	? parsedMaxSnapshotNodes
-	: DEFAULT_MAX_SNAPSHOT_NODES;
+const MAX_SNAPSHOT_NODES = CONFIG.maxSnapshotNodes;
 
 const MAX_EVAL_TIMEOUT = 300000;
 const DEFAULT_EVAL_TIMEOUT = 5000;
 const MAX_EVAL_EXTENDED_TIMEOUT = 300000;
 const DEFAULT_EVAL_EXTENDED_TIMEOUT = 30000;
 const MAX_RESULT_SIZE = 1048576; // 1MB
-const CONSOLE_BUFFER_SIZE = Math.max(100, parseInt(process.env.CAMOFOX_CONSOLE_BUFFER_SIZE || '1000', 10));
+const CONSOLE_BUFFER_SIZE = CONFIG.consoleBufferSize;
+const POST_ACTION_NAVIGATION_SETTLE_MS = 500;
+const POST_ACTION_NAVIGATION_DRAIN_TIMEOUT_MS = POST_ACTION_NAVIGATION_SETTLE_MS;
+const ACTION_TRACKER_POLL_MS = 10;
+type NavigationRoute = {
+	request: () => {
+		url: () => string;
+		isNavigationRequest?: () => boolean;
+		frame?: () => { page?: () => Page } | null;
+	};
+	continue: () => Promise<void>;
+	abort: (errorCode?: string) => Promise<void>;
+};
+const navigationGuardHandlers = new WeakMap<BrowserContext, (route: NavigationRoute) => Promise<void>>();
+const blockedNavigationErrors = new WeakMap<Page, string>();
+const trackedBlockedNavigationErrors = new WeakMap<Page, Map<number, string>>();
+const popupOpenerPages = new WeakMap<Page, Page>();
+const inFlightGuardChecks = new WeakMap<Page, number>();
+const trackedInFlightGuardChecks = new WeakMap<Page, Map<number, number>>();
+const trackedPendingCounts = new WeakMap<Page, Map<number, number>>();
+const actionTrackerInstalledPages = new WeakSet<Page>();
+const actionTrackerBindingContexts = new WeakSet<BrowserContext>();
+const actionTrackerTokens = new WeakMap<Page, number>();
+const activeTrackedActionTokens = new WeakMap<Page, number>();
 
 export const LONG_TEXT_THRESHOLD = 400;
 export const TYPE_TIMEOUT_BASE_MS = 10000;
@@ -66,6 +97,10 @@ interface EvaluateConfig {
 	maxTimeout: number;
 	defaultTimeout: number;
 }
+
+type BrowserTimerHandler = ((...args: unknown[]) => unknown) | string;
+type BrowserFrameRequestCallback = (timestamp: number) => void;
+type BrowserVoidFunction = () => void;
 
 // Per-tab locks to serialize operations on the same tab
 // tabId -> Promise (the currently executing operation)
@@ -150,15 +185,685 @@ export async function safePageClose(
 	}
 }
 
-export function validateUrl(url: string): string | null {
+function normalizeHostname(hostname: string): string {
+	return hostname.trim().replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+}
+
+function parseIpv4Octets(hostname: string): number[] | null {
+	const parts = hostname.split('.');
+	if (parts.length !== 4) return null;
+	const octets = parts.map((part) => Number.parseInt(part, 10));
+	if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return null;
+	return octets;
+}
+
+function isBlockedIpv4(hostname: string): boolean {
+	const octets = parseIpv4Octets(hostname);
+	if (!octets) return false;
+	const [a, b] = octets;
+	if (a === 0 || a === 10 || a === 127) return true;
+	if (a === 100 && b >= 64 && b <= 127) return true;
+	if (a === 169 && b === 254) return true;
+	if (a === 172 && b >= 16 && b <= 31) return true;
+	if (a === 192 && b === 168) return true;
+	if (a === 198 && (b === 18 || b === 19)) return true;
+	return false;
+}
+
+function isBlockedIpv6(hostname: string): boolean {
+	const normalized = normalizeHostname(hostname);
+	if (normalized === '::1') return true;
+
+	const nat64DottedMatch = normalized.match(/^64:ff9b::(\d+\.\d+\.\d+\.\d+)$/i);
+	if (nat64DottedMatch) {
+		return isBlockedIpv4(nat64DottedMatch[1]);
+	}
+
+	const nat64HexMatch = normalized.match(/^64:ff9b::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+	if (nat64HexMatch) {
+		const high = Number.parseInt(nat64HexMatch[1], 16);
+		const low = Number.parseInt(nat64HexMatch[2], 16);
+		if (Number.isFinite(high) && Number.isFinite(low)) {
+			const mappedIpv4 = [
+				(high >> 8) & 0xff,
+				high & 0xff,
+				(low >> 8) & 0xff,
+				low & 0xff,
+			].join('.');
+			return isBlockedIpv4(mappedIpv4);
+		}
+	}
+
+	const mappedIpv4Match = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+	if (mappedIpv4Match) {
+		return isBlockedIpv4(mappedIpv4Match[1]);
+	}
+
+	const mappedIpv4HexMatch = normalized.match(/^::ffff:([0-9a-f]{1,4})(?::([0-9a-f]{1,4}))?$/i);
+	if (mappedIpv4HexMatch) {
+		const high = Number.parseInt(mappedIpv4HexMatch[1], 16);
+		const low = Number.parseInt(mappedIpv4HexMatch[2] || '0', 16);
+		if (Number.isFinite(high) && Number.isFinite(low)) {
+			const mappedIpv4 = [
+				(high >> 8) & 0xff,
+				high & 0xff,
+				(low >> 8) & 0xff,
+				low & 0xff,
+			].join('.');
+			return isBlockedIpv4(mappedIpv4);
+		}
+	}
+
+	const firstHextetRaw = normalized.split(':', 1)[0] || '0';
+	const firstHextet = Number.parseInt(firstHextetRaw, 16);
+	if (!Number.isFinite(firstHextet)) return false;
+	if ((firstHextet & 0xfe00) === 0xfc00) return true;
+	if ((firstHextet & 0xffc0) === 0xfe80) return true;
+	return false;
+}
+
+function isBlockedPrivateNetworkHostname(hostname: string): boolean {
+	const normalized = normalizeHostname(hostname);
+	if (normalized === 'localhost' || normalized === 'localhost.localdomain') return true;
+	if (METADATA_HOSTNAMES.has(normalized)) return true;
+
+	const ipVersion = isIP(normalized);
+	if (ipVersion === 4) return isBlockedIpv4(normalized);
+	if (ipVersion === 6) return isBlockedIpv6(normalized);
+	return false;
+}
+
+export interface ValidateUrlOptions {
+	allowPrivateNetworkTargets?: boolean;
+}
+
+function createNavigationBlockError(message: string): Error & { statusCode: number } {
+	const error = new Error(message) as Error & { statusCode: number };
+	error.statusCode = 400;
+	return error;
+}
+
+function takeBlockedNavigationError(page: Page): (Error & { statusCode: number }) | null {
+	const message = blockedNavigationErrors.get(page);
+	if (!message) return null;
+	blockedNavigationErrors.delete(page);
+	return createNavigationBlockError(message);
+}
+
+function setTrackedBlockedNavigationError(page: Page, token: number, message: string): void {
+	const existing = trackedBlockedNavigationErrors.get(page) || new Map<number, string>();
+	existing.set(token, message);
+	trackedBlockedNavigationErrors.set(page, existing);
+}
+
+function takeTrackedBlockedNavigationError(page: Page, token: number): (Error & { statusCode: number }) | null {
+	const existing = trackedBlockedNavigationErrors.get(page);
+	const message = existing?.get(token);
+	if (!message) return null;
+	existing?.delete(token);
+	if (existing && existing.size === 0) {
+		trackedBlockedNavigationErrors.delete(page);
+	}
+	return createNavigationBlockError(message);
+}
+
+function rethrowWithBlockedNavigationError(page: Page, err: unknown): never {
+	const blockedError = takeBlockedNavigationError(page);
+	if (blockedError) throw blockedError;
+	throw err;
+}
+
+function rethrowWithTrackedBlockedNavigationError(page: Page, token: number, err: unknown): never {
+	const blockedError = takeTrackedBlockedNavigationError(page, token);
+	if (blockedError) throw blockedError;
+	throw err;
+}
+
+export function throwBlockedNavigationErrorIfPresent(page: Page): void {
+	const blockedError = takeBlockedNavigationError(page);
+	if (blockedError) throw blockedError;
+}
+
+function throwTrackedBlockedNavigationErrorIfPresent(page: Page, token: number): void {
+	const blockedError = takeTrackedBlockedNavigationError(page, token);
+	if (blockedError) throw blockedError;
+}
+
+function clearBlockedNavigationError(page: Page): void {
+	blockedNavigationErrors.delete(page);
+}
+
+function installActionTrackerScript(): void {
+	const browserGlobal = globalThis as any;
+	if (browserGlobal.__camofoxActionTracker) return;
+
+	const state = {
+		activeToken: 0,
+		pendingCounts: new Map<number, number>(),
+		timeoutTokens: new Map<any, number>(),
+		intervalTokens: new Map<any, number>(),
+		rafTokens: new Map<any, number>(),
+	};
+
+	const increment = (token: number) => {
+		state.pendingCounts.set(token, (state.pendingCounts.get(token) || 0) + 1);
+		void browserGlobal.__camofoxUpdatePendingCount?.(token, state.pendingCounts.get(token) || 0);
+	};
+
+	const decrement = (token: number) => {
+		const next = (state.pendingCounts.get(token) || 0) - 1;
+		if (next > 0) {
+			state.pendingCounts.set(token, next);
+		} else {
+			state.pendingCounts.delete(token);
+		}
+		void browserGlobal.__camofoxUpdatePendingCount?.(token, state.pendingCounts.get(token) || 0);
+	};
+
+	const syncActiveToken = (token: number) => {
+		state.activeToken = token;
+		void browserGlobal.__camofoxUpdateActiveToken?.(token);
+	};
+
+	const withToken = <T>(token: number, fn: () => T): T => {
+		const previousToken = state.activeToken;
+		syncActiveToken(token);
+		try {
+			return fn();
+		} finally {
+			syncActiveToken(previousToken);
+		}
+	};
+
+	const runHandler = (handler: BrowserTimerHandler, args: unknown[]) => {
+		if (typeof handler === 'function') {
+			return handler(...args);
+		}
+		return browserGlobal.eval(String(handler));
+	};
+
+	const originalSetTimeout = browserGlobal.setTimeout.bind(browserGlobal);
+	const originalClearTimeout = browserGlobal.clearTimeout.bind(browserGlobal);
+	const originalSetInterval = browserGlobal.setInterval.bind(browserGlobal);
+	const originalClearInterval = browserGlobal.clearInterval.bind(browserGlobal);
+	const originalRequestAnimationFrame = typeof browserGlobal.requestAnimationFrame === 'function'
+		? browserGlobal.requestAnimationFrame.bind(browserGlobal)
+		: null;
+	const originalCancelAnimationFrame = typeof browserGlobal.cancelAnimationFrame === 'function'
+		? browserGlobal.cancelAnimationFrame.bind(browserGlobal)
+		: null;
+	const originalQueueMicrotask = typeof browserGlobal.queueMicrotask === 'function'
+		? browserGlobal.queueMicrotask.bind(browserGlobal)
+		: null;
+
+	// Wrap tokenless callbacks too, so background work restores token 0 while a
+	// tracked action is in its bounded post-action attribution window.
+	browserGlobal.setTimeout = (handler: BrowserTimerHandler, delay?: number, ...args: unknown[]) => {
+		const token = state.activeToken;
+		let timeoutId: ReturnType<typeof setTimeout>;
+		const wrapped = (...callbackArgs: unknown[]) => {
+			const trackedToken = state.timeoutTokens.get(timeoutId) ?? token;
+			state.timeoutTokens.delete(timeoutId);
+			try {
+				return withToken(trackedToken, () => runHandler(handler, callbackArgs));
+			} finally {
+				if (trackedToken > 0) decrement(trackedToken);
+			}
+		};
+		timeoutId = originalSetTimeout(wrapped, delay, ...args);
+		if (token > 0) increment(token);
+		state.timeoutTokens.set(timeoutId, token);
+		return timeoutId;
+	};
+
+	browserGlobal.clearTimeout = (timeoutId: ReturnType<typeof setTimeout>) => {
+		const token = state.timeoutTokens.get(timeoutId);
+		if (token !== undefined) {
+			state.timeoutTokens.delete(timeoutId);
+			if (token > 0) decrement(token);
+		}
+		return originalClearTimeout(timeoutId);
+	};
+
+	browserGlobal.setInterval = (handler: BrowserTimerHandler, delay?: number, ...args: unknown[]) => {
+		const token = state.activeToken;
+		let intervalId: ReturnType<typeof setInterval>;
+		const wrapped = (...callbackArgs: unknown[]) => {
+			const trackedToken = state.intervalTokens.get(intervalId) ?? token;
+			if (trackedToken > 0) increment(trackedToken);
+			try {
+				return withToken(trackedToken, () => runHandler(handler, callbackArgs));
+			} finally {
+				if (trackedToken > 0) decrement(trackedToken);
+			}
+		};
+		intervalId = originalSetInterval(wrapped, delay, ...args);
+		state.intervalTokens.set(intervalId, token);
+		return intervalId;
+	};
+
+	browserGlobal.clearInterval = (intervalId: ReturnType<typeof setInterval>) => {
+		state.intervalTokens.delete(intervalId);
+		return originalClearInterval(intervalId);
+	};
+
+	if (originalRequestAnimationFrame && originalCancelAnimationFrame) {
+		browserGlobal.requestAnimationFrame = (callback: BrowserFrameRequestCallback) => {
+			const token = state.activeToken;
+			if (token > 0) increment(token);
+			let rafId = 0;
+			const wrapped: BrowserFrameRequestCallback = (timestamp: number) => {
+				const trackedToken = state.rafTokens.get(rafId) ?? token;
+				state.rafTokens.delete(rafId);
+				try {
+					return withToken(trackedToken, () => callback(timestamp));
+				} finally {
+					if (trackedToken > 0) decrement(trackedToken);
+				}
+			};
+			rafId = originalRequestAnimationFrame(wrapped);
+			state.rafTokens.set(rafId, token);
+			return rafId;
+		};
+
+		browserGlobal.cancelAnimationFrame = (rafId: number) => {
+			const token = state.rafTokens.get(rafId);
+			if (token !== undefined) {
+				state.rafTokens.delete(rafId);
+				if (token > 0) decrement(token);
+			}
+			return originalCancelAnimationFrame(rafId);
+		};
+	}
+
+	if (originalQueueMicrotask) {
+		browserGlobal.queueMicrotask = (callback: BrowserVoidFunction) => {
+			const token = state.activeToken;
+			if (token > 0) increment(token);
+			return originalQueueMicrotask(() => {
+				try {
+					return withToken(token, callback);
+				} finally {
+					if (token > 0) decrement(token);
+				}
+			});
+		};
+	}
+
+	browserGlobal.__camofoxActionTracker = {
+		startAction(token: number) {
+			syncActiveToken(token);
+		},
+		finishAction(token: number) {
+			if (state.activeToken === token) {
+				syncActiveToken(0);
+			}
+		},
+		getPendingCount(token: number) {
+			return state.pendingCounts.get(token) || 0;
+		},
+		getActiveToken() {
+			return state.activeToken || 0;
+		},
+	};
+}
+
+async function ensureActionNavigationTracker(page: Page): Promise<boolean> {
+	if (actionTrackerInstalledPages.has(page)) return true;
+	if (typeof page.addInitScript !== 'function' || typeof page.evaluate !== 'function') return false;
+
+	try {
+		const context = page.context();
+		if (!actionTrackerBindingContexts.has(context) && typeof (context as BrowserContext & { exposeBinding?: unknown }).exposeBinding === 'function') {
+			await (context as BrowserContext & {
+				exposeBinding: (
+					name: string,
+					callback: (source: { page?: Page }, token: unknown) => void | Promise<void>,
+				) => Promise<void>;
+			}).exposeBinding('__camofoxUpdateActiveToken', async ({ page: bindingPage }, token) => {
+				if (!bindingPage) return;
+				if (typeof token === 'number' && token > 0) {
+					activeTrackedActionTokens.set(bindingPage, token);
+				} else {
+					activeTrackedActionTokens.delete(bindingPage);
+				}
+			});
+			await (context as BrowserContext & {
+				exposeBinding: (
+					name: string,
+					callback: (source: { page?: Page }, token: unknown, count: unknown) => void | Promise<void>,
+				) => Promise<void>;
+			}).exposeBinding('__camofoxUpdatePendingCount', async ({ page: bindingPage }, token, count) => {
+				if (!bindingPage || typeof token !== 'number' || token <= 0) return;
+				const existing = trackedPendingCounts.get(bindingPage) || new Map<number, number>();
+				if (typeof count === 'number' && count > 0) {
+					existing.set(token, count);
+					trackedPendingCounts.set(bindingPage, existing);
+					return;
+				}
+				existing.delete(token);
+				if (existing.size === 0) {
+					trackedPendingCounts.delete(bindingPage);
+				} else {
+					trackedPendingCounts.set(bindingPage, existing);
+				}
+			});
+			actionTrackerBindingContexts.add(context);
+		}
+		await page.addInitScript(installActionTrackerScript);
+		await page.evaluate(installActionTrackerScript);
+		actionTrackerInstalledPages.add(page);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function nextActionTrackerToken(page: Page): number {
+	const nextToken = (actionTrackerTokens.get(page) || 0) + 1;
+	actionTrackerTokens.set(page, nextToken);
+	return nextToken;
+}
+
+async function startTrackedAction(page: Page): Promise<number | null> {
+	const trackerReady = await ensureActionNavigationTracker(page);
+	if (!trackerReady) return null;
+	const token = nextActionTrackerToken(page);
+	await page.evaluate((trackedToken) => {
+		(globalThis as any).__camofoxActionTracker?.startAction(trackedToken);
+	}, token);
+	activeTrackedActionTokens.set(page, token);
+	return token;
+}
+
+async function finishTrackedAction(page: Page, token: number | null): Promise<void> {
+	if (token === null || typeof page.evaluate !== 'function') return;
+	await page.evaluate((trackedToken) => {
+		(globalThis as any).__camofoxActionTracker?.finishAction(trackedToken);
+	}, token).catch(() => {});
+	if (activeTrackedActionTokens.get(page) === token) {
+		activeTrackedActionTokens.delete(page);
+	}
+}
+
+async function getTrackedPendingCount(page: Page, token: number): Promise<number> {
+	const syncedCount = trackedPendingCounts.get(page)?.get(token);
+	if (typeof syncedCount === 'number') {
+		return syncedCount;
+	}
+	if (typeof page.evaluate !== 'function') return 0;
+	try {
+		return await page.evaluate((trackedToken) => {
+			return (globalThis as any).__camofoxActionTracker?.getPendingCount(trackedToken) || 0;
+		}, token);
+	} catch {
+		return 0;
+	}
+}
+
+async function getCurrentTrackedActionToken(page: Page): Promise<number | null> {
+	if (typeof page.evaluate !== 'function' || !actionTrackerInstalledPages.has(page)) {
+		return activeTrackedActionTokens.get(page) || null;
+	}
+	try {
+		const token = await page.evaluate(() => {
+			return (globalThis as any).__camofoxActionTracker?.getActiveToken?.() || 0;
+		});
+		if (typeof token === 'number') {
+			return token > 0 ? token : null;
+		}
+		return activeTrackedActionTokens.get(page) || null;
+	} catch {
+		return activeTrackedActionTokens.get(page) || null;
+	}
+}
+
+function incrementInFlightGuardCheck(page: Page): void {
+	inFlightGuardChecks.set(page, (inFlightGuardChecks.get(page) || 0) + 1);
+}
+
+function decrementInFlightGuardCheck(page: Page): void {
+	const next = (inFlightGuardChecks.get(page) || 0) - 1;
+	if (next > 0) {
+		inFlightGuardChecks.set(page, next);
+	} else {
+		inFlightGuardChecks.delete(page);
+	}
+}
+
+function getInFlightGuardCheckCount(page: Page): number {
+	return inFlightGuardChecks.get(page) || 0;
+}
+
+function incrementTrackedInFlightGuardCheck(page: Page, token: number): void {
+	const existing = trackedInFlightGuardChecks.get(page) || new Map<number, number>();
+	existing.set(token, (existing.get(token) || 0) + 1);
+	trackedInFlightGuardChecks.set(page, existing);
+}
+
+function decrementTrackedInFlightGuardCheck(page: Page, token: number): void {
+	const existing = trackedInFlightGuardChecks.get(page);
+	if (!existing) return;
+	const next = (existing.get(token) || 0) - 1;
+	if (next > 0) {
+		existing.set(token, next);
+	} else {
+		existing.delete(token);
+	}
+	if (existing.size === 0) {
+		trackedInFlightGuardChecks.delete(page);
+	}
+}
+
+function getTrackedInFlightGuardCheckCount(page: Page, token: number): number {
+	return trackedInFlightGuardChecks.get(page)?.get(token) || 0;
+}
+
+async function yieldToPostActionNavigation(page: Page): Promise<void> {
+	if (typeof page.waitForTimeout === 'function') {
+		await page.waitForTimeout(0);
+		return;
+	}
+	await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function createPostActionNavigationTimeoutError(): Error & { statusCode: number } {
+	return createNavigationBlockError('Blocked navigation guard did not settle before the action completed');
+}
+
+async function withPostActionNavigationDeadline<T>(promise: Promise<T>, deadline: number): Promise<T> {
+	const remainingMs = deadline - Date.now();
+	if (remainingMs <= 0) throw createPostActionNavigationTimeoutError();
+	try {
+		return await withTimeout(promise, remainingMs, 'post-action navigation tracking');
+	} catch {
+		throw createPostActionNavigationTimeoutError();
+	}
+}
+
+async function drainPostActionNavigation(page: Page, actionToken: number): Promise<void> {
+	const deadline = Date.now() + POST_ACTION_NAVIGATION_DRAIN_TIMEOUT_MS;
+	await withPostActionNavigationDeadline(yieldToPostActionNavigation(page), deadline);
+
+	while (true) {
+		throwTrackedBlockedNavigationErrorIfPresent(page, actionToken);
+		const pendingCount = await withPostActionNavigationDeadline(getTrackedPendingCount(page, actionToken), deadline);
+		const inFlightGuardCount = getTrackedInFlightGuardCheckCount(page, actionToken);
+		const postActionPendingWork = pendingCount > 0 || inFlightGuardCount > 0 || getInFlightGuardCheckCount(page) > 0;
+		if (!postActionPendingWork) break;
+		await withPostActionNavigationDeadline(
+			new Promise((resolve) => setTimeout(resolve, ACTION_TRACKER_POLL_MS)),
+			deadline,
+		);
+	}
+
+	throwTrackedBlockedNavigationErrorIfPresent(page, actionToken);
+	// A tokenless navigation during the settle turn is background work. It was
+	// blocked by the guard, but must not become the select action's response or
+	// leak into the next operation.
+	clearBlockedNavigationError(page);
+}
+
+export async function flushBlockedNavigationError(page: Page): Promise<void> {
+	if (typeof page.waitForTimeout === 'function') {
+		await page.waitForTimeout(POST_ACTION_NAVIGATION_SETTLE_MS);
+	}
+	throwBlockedNavigationErrorIfPresent(page);
+}
+
+export interface BlockedNavigationTrackingOptions {
+	/** Yield once after actions whose DOM event can enqueue navigation after the action promise resolves. */
+	settlePostActionNavigation?: boolean;
+}
+
+export async function withBlockedNavigationTracking<T>(
+	page: Page,
+	action: () => Promise<T>,
+	options: BlockedNavigationTrackingOptions = {},
+): Promise<T> {
+	if (CONFIG.allowPrivateNetworkTargets) {
+		return action();
+	}
+
+	clearBlockedNavigationError(page);
+	const actionToken = await startTrackedAction(page);
+	clearBlockedNavigationError(page);
+	let finishedTracking = false;
+	const finish = async () => {
+		if (finishedTracking) return;
+		finishedTracking = true;
+		await finishTrackedAction(page, actionToken);
+	};
+
+	try {
+		const result = await action();
+		throwBlockedNavigationErrorIfPresent(page);
+
+		if (actionToken === null) {
+			await finish();
+			await flushBlockedNavigationError(page);
+			return result;
+		}
+
+		let sawPendingWork = false;
+		while (true) {
+			throwTrackedBlockedNavigationErrorIfPresent(page, actionToken);
+			if (sawPendingWork) {
+				throwBlockedNavigationErrorIfPresent(page);
+			}
+			const pendingCount = await getTrackedPendingCount(page, actionToken);
+			const inFlightGuardCount = getTrackedInFlightGuardCheckCount(page, actionToken);
+			if (pendingCount === 0 && inFlightGuardCount === 0) {
+				if (!sawPendingWork) {
+					await new Promise((resolve) => setTimeout(resolve, ACTION_TRACKER_POLL_MS));
+					throwTrackedBlockedNavigationErrorIfPresent(page, actionToken);
+					throwBlockedNavigationErrorIfPresent(page);
+					if ((await getTrackedPendingCount(page, actionToken)) === 0 && getTrackedInFlightGuardCheckCount(page, actionToken) === 0) {
+						break;
+					}
+					sawPendingWork = true;
+					continue;
+				}
+				await new Promise((resolve) => setTimeout(resolve, ACTION_TRACKER_POLL_MS));
+				throwTrackedBlockedNavigationErrorIfPresent(page, actionToken);
+				throwBlockedNavigationErrorIfPresent(page);
+				if ((await getTrackedPendingCount(page, actionToken)) === 0 && getTrackedInFlightGuardCheckCount(page, actionToken) === 0) break;
+			} else {
+				sawPendingWork = true;
+				await new Promise((resolve) => setTimeout(resolve, ACTION_TRACKER_POLL_MS));
+			}
+		}
+
+		throwTrackedBlockedNavigationErrorIfPresent(page, actionToken);
+		if (sawPendingWork) {
+			throwBlockedNavigationErrorIfPresent(page);
+		}
+		if (options.settlePostActionNavigation) {
+			// Some DOM actions (for example selectOption with a synchronous
+			// location.href handler) enqueue navigation after the action promise
+			// resolves without creating tracked timer work. Yield once while the
+			// action token is still active so the route guard can associate that
+			// request with this action before the in-flight drain below.
+			await drainPostActionNavigation(page, actionToken);
+		}
+		await finish();
+		return result;
+	} catch (err) {
+		await finish();
+		if (typeof err === 'object' && err !== null && 'statusCode' in err && typeof err.statusCode === 'number') {
+			throw err;
+		}
+		if (actionToken !== null) {
+			rethrowWithTrackedBlockedNavigationError(page, actionToken, err);
+		}
+		rethrowWithBlockedNavigationError(page, err);
+	}
+}
+
+export function validateUrl(url: string, options: ValidateUrlOptions = {}): string | null {
+	const { allowPrivateNetworkTargets = CONFIG.allowPrivateNetworkTargets } = options;
 	try {
 		const parsed = new URL(url);
 		if (!ALLOWED_URL_SCHEMES.includes(parsed.protocol as 'http:' | 'https:')) {
 			return `Blocked URL scheme: ${parsed.protocol} (only http/https allowed)`;
 		}
+		if (!allowPrivateNetworkTargets && isBlockedPrivateNetworkHostname(parsed.hostname)) {
+			return `Blocked private network target: ${parsed.hostname}`;
+		}
 		return null;
 	} catch {
 		return `Invalid URL: ${url}`;
+	}
+}
+
+async function hostnameResolvesToBlockedAddress(hostname: string): Promise<boolean> {
+	const normalized = normalizeHostname(hostname);
+	if (isBlockedPrivateNetworkHostname(normalized)) return true;
+
+	try {
+		const results = await lookup(normalized, { all: true, verbatim: true });
+		return results.some((result) => isBlockedPrivateNetworkHostname(result.address));
+	} catch {
+		return false;
+	}
+}
+
+export async function validateNavigationUrl(url: string, options: ValidateUrlOptions = {}): Promise<string | null> {
+	const urlError = validateUrl(url, options);
+	if (urlError) return urlError;
+
+	const { allowPrivateNetworkTargets = CONFIG.allowPrivateNetworkTargets } = options;
+	if (allowPrivateNetworkTargets) return null;
+
+	const parsed = new URL(url);
+	if (await hostnameResolvesToBlockedAddress(parsed.hostname)) {
+		return `Blocked private network target: ${parsed.hostname}`;
+	}
+	return null;
+}
+
+export async function navigateWithSafetyGuard(
+	page: Pick<Page, 'goto' | 'route' | 'unroute' | 'mainFrame'>,
+	targetUrl: string,
+	options: ValidateUrlOptions & { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle'; timeout?: number } = {},
+): Promise<void> {
+	const { allowPrivateNetworkTargets = CONFIG.allowPrivateNetworkTargets, waitUntil = 'domcontentloaded', timeout = 30000 } = options;
+	const initialError = await validateNavigationUrl(targetUrl, { allowPrivateNetworkTargets });
+	if (initialError) {
+		throw createNavigationBlockError(initialError);
+	}
+	if (allowPrivateNetworkTargets) {
+		await page.goto(targetUrl, { waitUntil, timeout });
+		return;
+	}
+
+	const typedPage = page as Page;
+	await ensureNavigationSafetyGuard(typedPage, { allowPrivateNetworkTargets });
+	blockedNavigationErrors.delete(typedPage);
+	try {
+		await page.goto(targetUrl, { waitUntil, timeout });
+	} catch (err) {
+		rethrowWithBlockedNavigationError(typedPage, err);
 	}
 }
 
@@ -206,53 +911,59 @@ export async function waitForPageReady(page: Page, options: WaitForPageReadyOpti
 	const { timeout = 10000, waitForNetwork = true } = options;
 
 	try {
-		await page.waitForLoadState('domcontentloaded', { timeout });
+		await withBlockedNavigationTracking(page, async () => {
+			await page.waitForLoadState('domcontentloaded', { timeout });
 
-		if (waitForNetwork) {
-			await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-				log('warn', 'networkidle timeout, continuing');
-			});
-		}
+			if (waitForNetwork) {
+				await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
+					log('warn', 'networkidle timeout, continuing');
+				});
+			}
 
-		// Framework hydration wait (React/Next.js/Vue) - mirrors Swift WebView.swift logic
-		// Wait for readyState === 'complete' + network quiet (40 iterations × 250ms max)
-		await page
-			.evaluate(async () => {
-				type ResourceTimingEntryLike = { responseEnd: number };
-				type PerformanceLike = {
-					getEntriesByType(type: 'resource'): ResourceTimingEntryLike[];
-					now(): number;
-				};
-				type DocumentLike = { readyState: string };
-				type RafLike = (cb: () => void) => number;
+			// Framework hydration wait (React/Next.js/Vue) - mirrors Swift WebView.swift logic
+			// Wait for readyState === 'complete' + network quiet (40 iterations × 250ms max)
+			await page
+				.evaluate(async () => {
+					type ResourceTimingEntryLike = { responseEnd: number };
+					type PerformanceLike = {
+						getEntriesByType(type: 'resource'): ResourceTimingEntryLike[];
+						now(): number;
+					};
+					type DocumentLike = { readyState: string };
+					type RafLike = (cb: () => void) => number;
 
-				const perf = (globalThis as unknown as { performance: PerformanceLike }).performance;
-				const doc = (globalThis as unknown as { document: DocumentLike }).document;
-				const raf = (globalThis as unknown as { requestAnimationFrame: RafLike }).requestAnimationFrame;
+					const perf = (globalThis as unknown as { performance: PerformanceLike }).performance;
+					const doc = (globalThis as unknown as { document: DocumentLike }).document;
+					const raf = (globalThis as unknown as { requestAnimationFrame: RafLike }).requestAnimationFrame;
 
-				for (let i = 0; i < 40; i++) {
-					// Check if network is quiet (no recent resource loads)
-					const entries = perf.getEntriesByType('resource');
-					const recentEntries = entries.slice(-5);
-					const netQuiet = recentEntries.every((e) => (perf.now() - e.responseEnd) > 400);
+					for (let i = 0; i < 40; i++) {
+						// Check if network is quiet (no recent resource loads)
+						const entries = perf.getEntriesByType('resource');
+						const recentEntries = entries.slice(-5);
+						const netQuiet = recentEntries.every((e) => (perf.now() - e.responseEnd) > 400);
 
-					if (doc.readyState === 'complete' && netQuiet) {
-						// Double RAF to ensure paint is complete
-						await new Promise<void>((r) => raf(() => raf(() => r())));
-						break;
+						if (doc.readyState === 'complete' && netQuiet) {
+							// Double RAF to ensure paint is complete
+							await new Promise<void>((r) => raf(() => raf(() => r())));
+							break;
+						}
+						await new Promise((r) => setTimeout(r, 250));
 					}
-					await new Promise((r) => setTimeout(r, 250));
-				}
-			})
-			.catch(() => {
-				log('warn', 'hydration wait failed, continuing');
-			});
+				})
+				.catch(() => {
+					log('warn', 'hydration wait failed, continuing');
+				});
 
-		await page.waitForTimeout(200);
-
-		await dismissConsentDialogs(page);
+			await page.waitForTimeout(200);
+			await dismissConsentDialogs(page);
+		});
 		return true;
 	} catch (err) {
+		if (typeof err === 'object' && err !== null && 'statusCode' in err && typeof err.statusCode === 'number') {
+			throw err;
+		}
+		const blockedError = takeBlockedNavigationError(page);
+		if (blockedError) throw blockedError;
 		const message = err instanceof Error ? err.message : String(err);
 		log('warn', 'page ready failed', { error: message });
 		return false;
@@ -303,13 +1014,13 @@ export async function dismissConsentDialogs(page: Page): Promise<void> {
 	}
 }
 
-export async function buildRefs(page: Page, snapshotTimeout?: number): Promise<Map<string, RefInfo>> {
+export async function buildRefs(page: Page): Promise<Map<string, RefInfo>> {
 	if (!page || page.isClosed()) {
 		log('warn', 'buildRefs: page closed or invalid');
 		return new Map<string, RefInfo>();
 	}
 
-	const ariaYaml = await getAriaSnapshot(page, snapshotTimeout !== undefined ? { snapshotTimeout } : {});
+	const ariaYaml = await getAriaSnapshot(page);
 	if (!ariaYaml) {
 		log('warn', 'buildRefs: no aria snapshot');
 		return new Map<string, RefInfo>();
@@ -351,89 +1062,16 @@ export function buildRefsFromAriaSnapshot(ariaYaml: string | null): Map<string, 
 	return refs;
 }
 
-export interface AriaSnapshotOptions {
-	/** CSS selector to scope snapshot to a subtree (e.g. dialog, form). Defaults to body. */
-	focusSelector?: string;
-	/** Hard cap on lines after filtering (heuristic viewport limit). */
-	maxLines?: number;
-	/** Restrict YAML to nodes whose role matches one of these (parents preserved). */
-	rolesFilter?: string[];
-	/** Timeout for ariaSnapshot call in ms. Defaults to 10000. Use low values (e.g. 100) for post-click best-effort snapshots. */
-	snapshotTimeout?: number;
-}
-
-export async function getAriaSnapshot(page: Page, options: AriaSnapshotOptions = {}): Promise<string | null> {
+export async function getAriaSnapshot(page: Page): Promise<string | null> {
 	if (!page || page.isClosed()) return null;
 	await waitForPageReady(page, { waitForNetwork: false });
-	const target = options.focusSelector ? page.locator(options.focusSelector).first() : page.locator('body');
-	const snapTimeout = options.snapshotTimeout ?? 10000;
-	let raw: string;
 	try {
-		raw = await target.ariaSnapshot({ timeout: snapTimeout });
+		return await page.locator('body').ariaSnapshot({ timeout: 10000 });
 	} catch {
-		if (snapTimeout < 1000) return null; // best-effort short timeout, don't retry
 		log('warn', 'ariaSnapshot failed, retrying');
 		await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
-		try {
-			raw = await target.ariaSnapshot({ timeout: snapTimeout });
-		} catch {
-			return null;
-		}
+		return page.locator('body').ariaSnapshot({ timeout: 10000 });
 	}
-	return postProcessAriaYaml(raw, options);
-}
-
-function postProcessAriaYaml(yaml: string, options: AriaSnapshotOptions): string {
-	let lines = yaml.split('\n');
-	if (options.rolesFilter && options.rolesFilter.length > 0) {
-		const allowed = new Set(options.rolesFilter.map((r) => r.toLowerCase()));
-		const keep = new Array<boolean>(lines.length).fill(false);
-		const indents = lines.map((l) => l.match(/^\s*/)?.[0].length ?? 0);
-		const roles = lines.map((l) => {
-			const m = l.match(/^\s*-\s+(\w+)/);
-			return m ? m[1].toLowerCase() : null;
-		});
-		// First pass: mark direct matches
-		for (let i = 0; i < lines.length; i++) {
-			if (roles[i] && allowed.has(roles[i] as string)) keep[i] = true;
-		}
-		// Second pass: keep ancestor chain of any kept line
-		for (let i = lines.length - 1; i >= 0; i--) {
-			if (!keep[i]) continue;
-			let parentIndent = indents[i];
-			for (let j = i - 1; j >= 0 && parentIndent > 0; j--) {
-				if (indents[j] < parentIndent) {
-					keep[j] = true;
-					parentIndent = indents[j];
-				}
-			}
-		}
-		lines = lines.filter((_, i) => keep[i]);
-	}
-	if (options.maxLines && lines.length > options.maxLines) {
-		lines = lines.slice(0, options.maxLines);
-		lines.push(`# ... truncated to ${options.maxLines} lines`);
-	}
-	return lines.join('\n');
-}
-
-/** Locate the topmost open Radix/ARIA dialog and snapshot it. */
-export async function getDialogAriaSnapshot(page: Page): Promise<{ snapshot: string; selector: string } | null> {
-	if (!page || page.isClosed()) return null;
-	const candidates = [
-		'[role="dialog"][data-state="open"]',
-		'[role="alertdialog"][data-state="open"]',
-		'[role="dialog"]:not([aria-hidden="true"])',
-		'[role="alertdialog"]:not([aria-hidden="true"])',
-	];
-	for (const sel of candidates) {
-		const loc = page.locator(sel).last();
-		if ((await loc.count().catch(() => 0)) > 0 && (await loc.isVisible().catch(() => false))) {
-			const snap = await getAriaSnapshot(page, { focusSelector: sel });
-			if (snap) return { snapshot: snap, selector: sel };
-		}
-	}
-	return null;
 }
 
 export function isElementRef(target: string): boolean {
@@ -518,7 +1156,104 @@ function attachConsoleListeners(state: TabState): void {
 	});
 }
 
-export function createTabState(page: Page): TabState {
+async function ensureNavigationSafetyGuard(page: Pick<Page, 'context'>, options: ValidateUrlOptions = {}): Promise<void> {
+	const { allowPrivateNetworkTargets = CONFIG.allowPrivateNetworkTargets } = options;
+	if (allowPrivateNetworkTargets) return;
+
+	const context = page.context();
+	if (navigationGuardHandlers.has(context)) return;
+
+	const routeHandler = async (route: NavigationRoute) => {
+		const request = route.request();
+		if (typeof request.isNavigationRequest === 'function' && !request.isNavigationRequest()) {
+			return route.continue();
+		}
+
+		const requestFrame = typeof request.frame === 'function' ? request.frame() : null;
+		const requestPage = requestFrame && typeof requestFrame.page === 'function' ? requestFrame.page() : null;
+		const relatedPages = new Set<Page>();
+		let trackedToken: number | null = null;
+		const addRelatedPage = (page: Page): void => {
+			if (relatedPages.has(page)) return;
+			relatedPages.add(page);
+			// Count the route before resolving the action token. The token lookup
+			// itself is asynchronous and the action wrapper must not finish while
+			// a guard check is still being associated with its page.
+			incrementInFlightGuardCheck(page);
+		};
+
+		try {
+			if (requestPage) {
+				addRelatedPage(requestPage);
+				trackedToken = await getCurrentTrackedActionToken(requestPage);
+				const mappedOpener = popupOpenerPages.get(requestPage);
+				if (mappedOpener) {
+					addRelatedPage(mappedOpener);
+					if (trackedToken === null) {
+						trackedToken = await getCurrentTrackedActionToken(mappedOpener);
+					}
+				} else if (typeof requestPage.opener === 'function') {
+					const openerPage = await requestPage.opener().catch(() => null);
+					if (openerPage) {
+						addRelatedPage(openerPage);
+						if (trackedToken === null) {
+							trackedToken = await getCurrentTrackedActionToken(openerPage);
+						}
+					}
+				}
+			}
+
+			if (trackedToken !== null) {
+				for (const relatedPage of relatedPages) {
+					incrementTrackedInFlightGuardCheck(relatedPage, trackedToken);
+				}
+			}
+
+			const requestError = await validateNavigationUrl(request.url(), { allowPrivateNetworkTargets: false });
+			if (requestError) {
+				for (const relatedPage of relatedPages) {
+					if (trackedToken !== null) {
+						setTrackedBlockedNavigationError(relatedPage, trackedToken, requestError);
+					} else {
+						blockedNavigationErrors.set(relatedPage, requestError);
+					}
+				}
+				return route.abort('blockedbyclient');
+			}
+			return route.continue();
+		} finally {
+			for (const relatedPage of relatedPages) {
+				decrementInFlightGuardCheck(relatedPage);
+				if (trackedToken !== null) {
+					decrementTrackedInFlightGuardCheck(relatedPage, trackedToken);
+				}
+			}
+		}
+	};
+
+	await context.route('**/*', routeHandler);
+	navigationGuardHandlers.set(context, routeHandler);
+}
+
+function isReusableInitialBlankPage(page: Page): boolean {
+	const taggedPage = page as Page & { __camofox_tabId?: string };
+	if (taggedPage.__camofox_tabId) return false;
+	if (typeof page.isClosed !== 'function' || page.isClosed()) return false;
+	return page.url() === 'about:blank';
+}
+
+export async function acquirePageForNewTab(context: BrowserContext): Promise<Page> {
+	if (typeof context.pages !== 'function') {
+		return context.newPage();
+	}
+	const pages = context.pages();
+	if (pages.length === 1 && isReusableInitialBlankPage(pages[0])) {
+		return pages[0];
+	}
+	return context.newPage();
+}
+
+export async function createTabState(page: Page): Promise<TabState> {
 	const state: TabState = {
 		page,
 		refs: new Map(),
@@ -529,10 +1264,18 @@ export function createTabState(page: Page): TabState {
 	};
 
 	attachConsoleListeners(state);
+	page.on('popup', (popupPage) => {
+		popupOpenerPages.set(popupPage, page);
+	});
+	await ensureNavigationSafetyGuard(page, { allowPrivateNetworkTargets: CONFIG.allowPrivateNetworkTargets });
 	return state;
 }
 
-export async function navigateTab(tabId: string, tabState: TabState, params: { url?: string; macro?: string; query?: string }): Promise<{ ok: true; url: string }>{
+export async function navigateTab(
+	tabId: string,
+	tabState: TabState,
+	params: { url?: string; macro?: string; query?: string; allowPrivateNetworkTargets?: boolean },
+): Promise<{ ok: true; url: string }>{
 	const { url, macro, query } = params;
 	let targetUrl = url;
 	if (macro) {
@@ -542,7 +1285,7 @@ export async function navigateTab(tabId: string, tabState: TabState, params: { u
 		throw new Error('url or macro required');
 	}
 
-	const urlErr = validateUrl(targetUrl);
+	const urlErr = await validateNavigationUrl(targetUrl, { allowPrivateNetworkTargets: params.allowPrivateNetworkTargets });
 	if (urlErr) {
 		const err = new Error(urlErr);
 		// Used by routes to map to 400.
@@ -551,337 +1294,131 @@ export async function navigateTab(tabId: string, tabState: TabState, params: { u
 	}
 
 	return withTabLock(tabId, async () => {
-		await tabState.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+		await navigateWithSafetyGuard(tabState.page, targetUrl, {
+			allowPrivateNetworkTargets: params.allowPrivateNetworkTargets,
+			waitUntil: 'domcontentloaded',
+			timeout: 30000,
+		});
 		tabState.visitedUrls.add(targetUrl);
 		tabState.refs = await buildRefs(tabState.page);
 		return { ok: true as const, url: tabState.page.url() };
 	});
 }
 
-export interface SnapshotTabOptions extends AriaSnapshotOptions {
-	currentTask?: string;
-	lastAction?: string;
-	/** Mark lines that did not exist in the previous snapshot with `*`. Default: true. */
-	diff?: boolean;
-}
-
-function applyDiffMarkers(
-	annotatedYaml: string,
-	previous: string | null | undefined,
-): { yaml: string; newCount: number } {
-	if (!previous) return { yaml: annotatedYaml, newCount: 0 };
-	const prevSet = new Set(previous.split('\n').map((l) => l.trim()).filter(Boolean));
-	let newCount = 0;
-	const lines = annotatedYaml.split('\n').map((line) => {
-		const trimmed = line.trim();
-		if (!trimmed || trimmed.startsWith('#')) return line;
-		if (!trimmed.startsWith('-')) return line;
-		if (prevSet.has(trimmed)) return line;
-		newCount++;
-		const indentMatch = line.match(/^(\s*)/);
-		const indent = indentMatch ? indentMatch[1] : '';
-		return `${indent}* ${line.trimStart()}`;
-	});
-	return { yaml: lines.join('\n'), newCount };
-}
-
-export async function snapshotTab(
-	tabState: TabState,
-	options: SnapshotTabOptions = {},
-): Promise<{ url: string; snapshot: string; refsCount: number; scoped?: boolean; newElementsCount?: number }> {
-	const { currentTask, lastAction, diff = true, ...ariaOpts } = options;
-	const ariaYaml = await getAriaSnapshot(tabState.page, ariaOpts);
+export async function snapshotTab(tabState: TabState): Promise<{ url: string; snapshot: string; refsCount: number }>{
+	const ariaYaml = await getAriaSnapshot(tabState.page);
 	tabState.refs = buildRefsFromAriaSnapshot(ariaYaml);
-	let annotatedYaml = annotateAriaYamlWithRefs(ariaYaml, tabState.refs);
-
-	let newElementsCount = 0;
-	if (diff && !ariaOpts.focusSelector && !ariaOpts.rolesFilter?.length) {
-		// Only diff full-body snapshots to avoid spurious markers on scoped views.
-		const result = applyDiffMarkers(annotatedYaml, tabState.lastSnapshot);
-		annotatedYaml = result.yaml;
-		newElementsCount = result.newCount;
-		// Save un-marked baseline for next diff.
-		tabState.lastSnapshot = annotateAriaYamlWithRefs(ariaYaml, tabState.refs);
-	}
-
-	if (currentTask || lastAction) {
-		const banner: string[] = [];
-		if (currentTask) banner.push(`# task: ${currentTask.replace(/\n/g, ' ').slice(0, 200)}`);
-		if (lastAction) banner.push(`# last_action: ${lastAction.replace(/\n/g, ' ').slice(0, 200)}`);
-		if (newElementsCount > 0) banner.push(`# new_elements: ${newElementsCount} (marked with *)`);
-		annotatedYaml = `${banner.join('\n')}\n${annotatedYaml}`;
-	} else if (newElementsCount > 0) {
-		annotatedYaml = `# new_elements: ${newElementsCount} (marked with *)\n${annotatedYaml}`;
-	}
-
+	const annotatedYaml = annotateAriaYamlWithRefs(ariaYaml, tabState.refs);
 	return {
 		url: tabState.page.url(),
 		snapshot: annotatedYaml,
 		refsCount: tabState.refs.size,
-		scoped: Boolean(ariaOpts.focusSelector || ariaOpts.rolesFilter?.length || ariaOpts.maxLines),
-		newElementsCount: newElementsCount > 0 ? newElementsCount : undefined,
 	};
 }
 
-export async function snapshotTabDialog(
-	tabState: TabState,
-): Promise<{ url: string; snapshot: string; refsCount: number; selector: string } | null> {
-	const found = await getDialogAriaSnapshot(tabState.page);
-	if (!found) return null;
-	tabState.refs = buildRefsFromAriaSnapshot(found.snapshot);
-	const annotatedYaml = annotateAriaYamlWithRefs(found.snapshot, tabState.refs);
-	return {
-		url: tabState.page.url(),
-		snapshot: annotatedYaml,
-		refsCount: tabState.refs.size,
-		selector: found.selector,
-	};
-}
-
-export type ClickStrategy = 'locator' | 'force' | 'mouse' | 'jsdispatch' | 'keyboard-space';
-
-export interface ClickOptions {
-	ref?: string;
-	selector?: string;
-	/** Per-strategy Playwright timeout in ms. Range 1000-30000, default 5000. */
-	timeout?: number;
-	/** Skip plain locator click and start at force/mouse fallback chain. */
-	force?: boolean;
-	/** After click, verify a state change (aria-checked, data-state, input value, URL). */
-	verify?: boolean;
-}
-
-export interface ClickResult {
-	ok: true;
+export interface SnapshotPayload {
 	url: string;
-	strategy: ClickStrategy;
-	attempts: number;
-	verifiedStateChange?: boolean;
-	/** Pre/post snapshots used for verification (debugging aid). */
-	verifyDetails?: { before?: Record<string, string | null>; after?: Record<string, string | null> };
+	snapshot: string;
+	refsCount: number;
+	offset: number;
+	truncated: boolean;
+	totalChars: number;
+	hasMore: boolean;
+	nextOffset: number | null;
 }
 
-const DEFAULT_CLICK_TIMEOUT_MS = 20000;
-const MIN_CLICK_TIMEOUT_MS = 1000;
-const MAX_CLICK_TIMEOUT_MS = 30000;
-const RETRY_BACKOFF_MS = [0, 300, 1000] as const;
+export function buildSnapshotPayload(
+	raw: { url: string; snapshot: string; refsCount: number },
+	offset: number = 0,
+): SnapshotPayload {
+	const windowed = windowSnapshot(raw.snapshot, offset, CONFIG.maxSnapshotChars, CONFIG.snapshotTailChars);
+	return {
+		url: raw.url,
+		snapshot: windowed.text,
+		refsCount: raw.refsCount,
+		offset: windowed.offset,
+		truncated: windowed.truncated,
+		totalChars: windowed.totalChars,
+		hasMore: windowed.hasMore ?? false,
+		nextOffset: windowed.nextOffset ?? null,
+	};
+}
 
-export async function clickTab(tabId: string, tabState: TabState, params: ClickOptions): Promise<ClickResult> {
-	const { ref, selector, force = false, verify = false } = params;
+export async function clickTab(tabId: string, tabState: TabState, params: { ref?: string; selector?: string }): Promise<{ ok: true; url: string }>{
+	const { ref, selector } = params;
 	if (!ref && !selector) {
 		const err = new Error('ref or selector required');
 		(err as Error & { statusCode?: number }).statusCode = 400;
 		throw err;
 	}
 
-	const timeout = Math.min(
-		MAX_CLICK_TIMEOUT_MS,
-		Math.max(MIN_CLICK_TIMEOUT_MS, params.timeout ?? DEFAULT_CLICK_TIMEOUT_MS),
-	);
-
 	return withTabLock(tabId, async () => {
-		const page = tabState.page;
-
-		// Capture verify state (best-effort; failures are non-fatal for click itself)
-		const captureVerifyState = async (locator: Locator): Promise<Record<string, string | null>> => {
-			try {
-				return await locator.evaluate((el) => {
-					const e = el as { getAttribute?: (k: string) => string | null; value?: string; checked?: boolean };
-					return {
-						ariaChecked: e.getAttribute?.('aria-checked') ?? null,
-						ariaPressed: e.getAttribute?.('aria-pressed') ?? null,
-						ariaExpanded: e.getAttribute?.('aria-expanded') ?? null,
-						dataState: e.getAttribute?.('data-state') ?? null,
-						value: typeof e.value === 'string' ? e.value : null,
-						checked: typeof e.checked === 'boolean' ? String(e.checked) : null,
-					};
-				});
-			} catch {
-				return {};
-			}
-		};
-
-		const dispatchMouseSequence = async (locator: Locator): Promise<void> => {
+		try {
+			const dispatchMouseSequence = async (locator: Locator): Promise<void> => {
 			const box = await locator.boundingBox();
 			if (!box) throw new Error('Element not visible (no bounding box)');
+
 			const x = box.x + box.width / 2;
 			const y = box.y + box.height / 2;
-			await page.mouse.move(x, y);
-			await page.waitForTimeout(50);
-			await page.mouse.down();
-			await page.waitForTimeout(50);
-			await page.mouse.up();
+
+			await tabState.page.mouse.move(x, y);
+			await tabState.page.waitForTimeout(50);
+
+			await tabState.page.mouse.down();
+			await tabState.page.waitForTimeout(50);
+			await tabState.page.mouse.up();
+
 			log('info', 'mouse sequence dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
 		};
 
-		// JS dispatchEvent fallback (the manual workaround that consistently worked
-		// against Radix UI dialog buttons / autocomplete options where Playwright's
-		// locator.click times out despite the element being visible/enabled).
-		const dispatchJsClick = async (locator: Locator): Promise<void> => {
-			await locator.evaluate((el) => {
-				const browserGlobal = globalThis as { MouseEvent?: { new(type: string, init?: { bubbles?: boolean; cancelable?: boolean }): unknown } };
-				const MouseEventCtor = browserGlobal.MouseEvent;
-				if (typeof MouseEventCtor !== 'function') return;
-				const target = el as { dispatchEvent: (ev: unknown) => boolean };
-				const opts = { bubbles: true, cancelable: true };
-				target.dispatchEvent(new MouseEventCtor('mousedown', opts));
-				target.dispatchEvent(new MouseEventCtor('mouseup', opts));
-				target.dispatchEvent(new MouseEventCtor('click', opts));
-			});
-		};
+			const doClick = async (locatorOrSelector: Locator | string, isLocator: boolean): Promise<void> => {
+				const locator = isLocator ? (locatorOrSelector as Locator) : tabState.page.locator(locatorOrSelector as string);
 
-		// Radix UI custom checkboxes: button[role=checkbox] with data-state="checked|unchecked".
-		// Playwright's click occasionally fails to flip aria-checked. Pressing Space on
-		// the focused element reliably toggles the controlled state.
-		const keyboardSpace = async (locator: Locator): Promise<void> => {
-			await locator.focus();
-			await page.keyboard.press('Space');
-		};
-
-		const tryStrategy = async (locator: Locator, strategy: ClickStrategy): Promise<void> => {
-			switch (strategy) {
-				case 'locator':
-					await locator.click({ timeout });
-					return;
-				case 'force':
-					await locator.click({ timeout, force: true });
-					return;
-				case 'mouse':
-					await dispatchMouseSequence(locator);
-					return;
-				case 'jsdispatch':
-					await dispatchJsClick(locator);
-					return;
-				case 'keyboard-space':
-					await keyboardSpace(locator);
-					return;
-			}
-		};
-
-		const buildLocator = (): Locator | Promise<Locator | null> => {
-			if (ref) return refToLocator(page, ref, tabState.refs);
-			return Promise.resolve(page.locator(selector as string));
-		};
-
-		const initialLocator = await buildLocator();
-		if (!initialLocator) {
-			const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
-			const err = new Error(
-				`Unknown ref: ${ref} (valid refs: e1-${maxRef}, ${tabState.refs.size} total). Refs reset after navigation - call snapshot first.`,
-			);
-			(err as Error & { statusCode?: number }).statusCode = 400;
-			throw err;
-		}
-
-		// Build the strategy ladder. If `force=true` we skip the plain locator click.
-		const strategyOrder: ClickStrategy[] = force
-			? ['force', 'mouse', 'jsdispatch']
-			: ['locator', 'force', 'mouse', 'jsdispatch'];
-
-		// Auto-detect Radix-style controlled checkbox / switch and add keyboard-space last.
-		try {
-			const isControlledToggle = await initialLocator.evaluate((el) => {
-				const e = el as { getAttribute?: (k: string) => string | null };
-				const role = e.getAttribute?.('role');
-				const dataState = e.getAttribute?.('data-state');
-				return (role === 'checkbox' || role === 'switch') && (dataState === 'checked' || dataState === 'unchecked');
-			}).catch(() => false);
-			if (isControlledToggle) strategyOrder.push('keyboard-space');
-		} catch {
-			/* non-fatal */
-		}
-
-		const before = verify ? await captureVerifyState(initialLocator) : undefined;
-		const beforeUrl = page.url();
-
-		let lastErr: unknown;
-		let chosenStrategy: ClickStrategy = strategyOrder[0];
-		let attempts = 0;
-		// Strategies that proved useless this click (e.g. force after locator already timed out).
-		const skippedStrategies = new Set<ClickStrategy>();
-
-		outer: for (let attempt = 0; attempt < RETRY_BACKOFF_MS.length; attempt++) {
-			if (RETRY_BACKOFF_MS[attempt] > 0) {
-				// If the URL already changed while we were waiting to retry, the click
-				// already had its intended effect — don't fire a second time.
-				if (page.url() !== beforeUrl) {
-					chosenStrategy = strategyOrder[0];
-					lastErr = undefined;
-					log('info', 'click: URL changed before retry, treating as success');
-					break outer;
-				}
-				await page.waitForTimeout(RETRY_BACKOFF_MS[attempt]);
-				// Check again after the wait.
-				if (page.url() !== beforeUrl) {
-					chosenStrategy = strategyOrder[0];
-					lastErr = undefined;
-					log('info', 'click: URL changed during backoff, treating as success');
-					break outer;
-				}
-			}
-			// On retries, refresh the locator (refs may be stale after partial DOM updates).
-			const locator = attempt === 0 ? initialLocator : (await buildLocator()) ?? initialLocator;
-
-			for (const strategy of strategyOrder) {
-				if (skippedStrategies.has(strategy)) continue;
-				attempts++;
 				try {
-					await tryStrategy(locator, strategy);
-					chosenStrategy = strategy;
-					lastErr = undefined;
-					break outer;
+					await locator.click({ timeout: CLICK_TIMEOUT_MS });
 				} catch (err) {
-					lastErr = err;
 					const message = err instanceof Error ? err.message : String(err);
-					log('warn', 'click strategy failed', { strategy, attempt, message: message.slice(0, 200) });
-					// Hard errors that no fallback can fix → abort.
-					if (/closed|navigation|context destroyed|browser has been closed/i.test(message)) {
+					if (message.includes('intercepts pointer events')) {
+						log('warn', 'click intercepted, retrying with force');
+						try {
+							await locator.click({ timeout: CLICK_TIMEOUT_MS, force: true });
+						} catch {
+							log('warn', 'force click failed, trying mouse sequence');
+							await dispatchMouseSequence(locator);
+						}
+					} else if (message.includes('not visible') || message.includes('timeout')) {
+						log('warn', 'click timeout, trying mouse sequence');
+						await dispatchMouseSequence(locator);
+					} else {
 						throw err;
 					}
-					// locator timed out → force uses the same Playwright locator path and will
-					// also time out. Skip it to go straight to mouse.
-					if (strategy === 'locator' && /timeout/i.test(message)) {
-						skippedStrategies.add('force');
-					}
 				}
-			}
-		}
+			};
 
-		if (lastErr) {
-			throw lastErr;
-		}
+			await withBlockedNavigationTracking(tabState.page, async () => {
+				if (ref) {
+					const locator = await refToLocator(tabState.page, ref, tabState.refs);
+					if (!locator) {
+						const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
+						const err = new Error(
+							`Unknown ref: ${ref} (valid refs: e1-${maxRef}, ${tabState.refs.size} total). Refs reset after navigation - call snapshot first.`,
+						);
+						(err as any).statusCode = 400;
+						throw err;
+					}
+					await doClick(locator, true);
+				} else {
+					await doClick(selector as string, false);
+				}
+			});
+			tabState.refs = await buildRefs(tabState.page);
 
-		await page.waitForTimeout(1000);
-		// Best-effort 100ms snapshot; if the DOM hasn't settled yet (< 5 refs), wait
-		// another 500ms and do a proper 2s snapshot.
-		let postClickRefs = await buildRefs(page, 100);
-		if (postClickRefs.size < 5) {
-			await page.waitForTimeout(500);
-			postClickRefs = await buildRefs(page, 2000);
+			const newUrl = tabState.page.url();
+			tabState.visitedUrls.add(newUrl);
+			return { ok: true as const, url: newUrl };
+		} catch (err) {
+			rethrowWithBlockedNavigationError(tabState.page, err);
 		}
-		tabState.refs = postClickRefs;
-
-		let verifiedStateChange: boolean | undefined;
-		let verifyDetails: ClickResult['verifyDetails'];
-		if (verify && before) {
-			const newLocator = (await buildLocator()) ?? null;
-			const after = newLocator ? await captureVerifyState(newLocator) : {};
-			verifyDetails = { before, after };
-			const urlChanged = page.url() !== beforeUrl;
-			const stateChanged = Object.keys(before).some((k) => before[k] !== after[k]);
-			verifiedStateChange = urlChanged || stateChanged;
-		}
-
-		const newUrl = page.url();
-		tabState.visitedUrls.add(newUrl);
-		return {
-			ok: true as const,
-			url: newUrl,
-			strategy: chosenStrategy,
-			attempts,
-			...(verifiedStateChange !== undefined ? { verifiedStateChange } : {}),
-			...(verifyDetails ? { verifyDetails } : {}),
-		};
 	});
 }
 
@@ -986,7 +1523,9 @@ export async function typeTab(tabId: string, tabState: TabState, params: { ref?:
 			locator = tabState.page.locator(selector as string);
 		}
 
-		await smartFill(locator, tabState.page, text);
+		await withBlockedNavigationTracking(tabState.page, async () => {
+			await smartFill(locator, tabState.page, text);
+		});
 	});
 
 	return { ok: true as const };
@@ -994,16 +1533,28 @@ export async function typeTab(tabId: string, tabState: TabState, params: { ref?:
 
 export async function pressTab(tabId: string, tabState: TabState, key: string): Promise<{ ok: true }>{
 	await withTabLock(tabId, async () => {
-		await tabState.page.keyboard.press(key);
+		try {
+			await withBlockedNavigationTracking(tabState.page, async () => {
+				await tabState.page.keyboard.press(key);
+			});
+		} catch (err) {
+			rethrowWithBlockedNavigationError(tabState.page, err);
+		}
 	});
 	return { ok: true as const };
 }
 
-export async function scrollTab(tabState: TabState, params: { direction?: 'up' | 'down'; amount?: number }): Promise<{ ok: true }>{
+export async function scrollTab(
+	tabState: TabState,
+	params: { direction?: 'up' | 'down' | 'left' | 'right'; amount?: number },
+): Promise<{ ok: true }>{
 	const { direction = 'down', amount = 500 } = params;
-	const delta = direction === 'up' ? -amount : amount;
-	await tabState.page.mouse.wheel(0, delta);
-	await tabState.page.waitForTimeout(300);
+	const isHorizontal = direction === 'left' || direction === 'right';
+	const delta = direction === 'up' || direction === 'left' ? -amount : amount;
+	await withBlockedNavigationTracking(tabState.page, async () => {
+		await tabState.page.mouse.wheel(isHorizontal ? delta : 0, isHorizontal ? 0 : delta);
+		await tabState.page.waitForTimeout(300);
+	});
 	return { ok: true as const };
 }
 
@@ -1046,32 +1597,34 @@ export async function scrollElementTab(
 
 		const element = locator.first();
 
-		if (scrollTo) {
-			await element.evaluate(
-				(el, pos) => {
-					const e = el as unknown as { scrollTop: number; scrollLeft: number };
-					const p = pos as { top?: number; left?: number };
-					if (p.top !== undefined) e.scrollTop = p.top;
-					if (p.left !== undefined) e.scrollLeft = p.left;
-				},
-				scrollTo,
-			);
-		} else {
-			const deltaX = params.deltaX ?? 0;
-			const deltaY = params.deltaY ?? 300;
-			await element.evaluate(
-				(el, delta) => {
-					(el as unknown as { scrollBy: (opts: { top: number; left: number; behavior: 'auto' }) => void }).scrollBy({
-						top: (delta as { y: number }).y,
-						left: (delta as { x: number }).x,
-						behavior: 'auto',
-					});
-				},
-				{ x: deltaX, y: deltaY },
-			);
-		}
+		await withBlockedNavigationTracking(page, async () => {
+			if (scrollTo) {
+				await element.evaluate(
+					(el, pos) => {
+						const e = el as unknown as { scrollTop: number; scrollLeft: number };
+						const p = pos as { top?: number; left?: number };
+						if (p.top !== undefined) e.scrollTop = p.top;
+						if (p.left !== undefined) e.scrollLeft = p.left;
+					},
+					scrollTo,
+				);
+			} else {
+				const deltaX = params.deltaX ?? 0;
+				const deltaY = params.deltaY ?? 300;
+				await element.evaluate(
+					(el, delta) => {
+						(el as unknown as { scrollBy: (opts: { top: number; left: number; behavior: 'auto' }) => void }).scrollBy({
+							top: (delta as { y: number }).y,
+							left: (delta as { x: number }).x,
+							behavior: 'auto',
+						});
+					},
+					{ x: deltaX, y: deltaY },
+				);
+			}
 
-		await page.waitForTimeout(200);
+			await page.waitForTimeout(200);
+		});
 
 		const scrollPosition = (await element.evaluate((el) => {
 			const e = el as unknown as {
@@ -1123,7 +1676,9 @@ async function _evaluateInternal(
 		});
 
 		try {
-			const result = await Promise.race([page.evaluate(params.expression), timeoutPromise]);
+			const result = await withBlockedNavigationTracking(page, async () => {
+				return Promise.race([page.evaluate(params.expression), timeoutPromise]);
+			});
 
 			const serialized = JSON.stringify(result);
 			if (serialized === undefined) {
@@ -1152,7 +1707,11 @@ async function _evaluateInternal(
 				truncated: false,
 			};
 		} catch (err: unknown) {
+			if (typeof err === 'object' && err !== null && 'statusCode' in err && typeof err.statusCode === 'number') {
+				throw err;
+			}
 			const message = err instanceof Error ? err.message : String(err);
+			throwBlockedNavigationErrorIfPresent(page);
 			if (message === 'EVAL_TIMEOUT') {
 				return {
 					ok: false,
@@ -1184,25 +1743,37 @@ export async function evaluateTabExtended(
 
 export async function backTab(tabId: string, tabState: TabState): Promise<{ ok: true; url: string }>{
 	return withTabLock(tabId, async () => {
-		await tabState.page.goBack({ timeout: 10000 });
-		tabState.refs = await buildRefs(tabState.page);
-		return { ok: true as const, url: tabState.page.url() };
+		try {
+			await tabState.page.goBack({ timeout: 10000 });
+			tabState.refs = await buildRefs(tabState.page);
+			return { ok: true as const, url: tabState.page.url() };
+		} catch (err) {
+			rethrowWithBlockedNavigationError(tabState.page, err);
+		}
 	});
 }
 
 export async function forwardTab(tabId: string, tabState: TabState): Promise<{ ok: true; url: string }>{
 	return withTabLock(tabId, async () => {
-		await tabState.page.goForward({ timeout: 10000 });
-		tabState.refs = await buildRefs(tabState.page);
-		return { ok: true as const, url: tabState.page.url() };
+		try {
+			await tabState.page.goForward({ timeout: 10000 });
+			tabState.refs = await buildRefs(tabState.page);
+			return { ok: true as const, url: tabState.page.url() };
+		} catch (err) {
+			rethrowWithBlockedNavigationError(tabState.page, err);
+		}
 	});
 }
 
 export async function refreshTab(tabId: string, tabState: TabState): Promise<{ ok: true; url: string }>{
 	return withTabLock(tabId, async () => {
-		await tabState.page.reload({ timeout: 30000 });
-		tabState.refs = await buildRefs(tabState.page);
-		return { ok: true as const, url: tabState.page.url() };
+		try {
+			await tabState.page.reload({ timeout: 30000 });
+			tabState.refs = await buildRefs(tabState.page);
+			return { ok: true as const, url: tabState.page.url() };
+		} catch (err) {
+			rethrowWithBlockedNavigationError(tabState.page, err);
+		}
 	});
 }
 
@@ -1263,30 +1834,9 @@ export async function getLinks(
 	};
 }
 
-export interface ScreenshotOptions {
-	fullPage?: boolean;
-	/** Restrict capture to a region; reduces vision token cost. */
-	clip?: { x: number; y: number; width: number; height: number };
-	/** 'png' (default) or 'jpeg'. JPEG enables `quality` and shrinks payload. */
-	type?: 'png' | 'jpeg';
-	/** JPEG quality 1-100 (only when type='jpeg'). */
-	quality?: number;
-}
-
-export async function screenshotTab(tabState: TabState, options: ScreenshotOptions | boolean = {}): Promise<{ buffer: Buffer; mime: 'image/png' | 'image/jpeg' }> {
-	// Backward-compatible: caller passing a boolean = legacy fullPage flag.
-	const opts: ScreenshotOptions = typeof options === 'boolean' ? { fullPage: options } : options;
-	const type = opts.type ?? 'png';
-	const playwrightOpts: { type: 'png' | 'jpeg'; fullPage?: boolean; clip?: { x: number; y: number; width: number; height: number }; quality?: number } = {
-		type,
-		fullPage: opts.fullPage,
-	};
-	if (opts.clip) playwrightOpts.clip = opts.clip;
-	if (type === 'jpeg' && typeof opts.quality === 'number') {
-		playwrightOpts.quality = Math.max(1, Math.min(100, Math.round(opts.quality)));
-	}
-	const buffer = await tabState.page.screenshot(playwrightOpts);
-	return { buffer: buffer as Buffer, mime: type === 'jpeg' ? 'image/jpeg' : 'image/png' };
+export async function screenshotTab(tabState: TabState, fullPage: boolean): Promise<Buffer> {
+	const buffer = await tabState.page.screenshot({ type: 'png', fullPage });
+	return buffer as Buffer;
 }
 
 export async function waitTab(tabState: TabState, params: { timeout: number; waitForNetwork: boolean }): Promise<{ ok: true; ready: boolean }>{

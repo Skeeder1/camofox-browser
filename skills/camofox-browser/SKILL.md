@@ -9,7 +9,7 @@ allowed-tools: Bash(camofox:*)
 Camofox is an anti-detection browser automation system built on Camoufox + Playwright with:
 - CLI (`camofox`) for operator workflows
 - REST API (port `9377` by default) for programmatic control
-- OpenClaw-compatible REST routes for agent frameworks
+- OpenClaw plugin integration (`plugin.ts`) with 18 plugin tools
 
 This skill is optimized for bot-evasion workflows where default browser automation gets flagged.
 
@@ -18,7 +18,7 @@ This skill is optimized for bot-evasion workflows where default browser automati
 Use this skill instead of generic browser tooling when at least one applies:
 - You need anti-detection browser identity continuity across sessions.
 - You need proxy-aware geolocation behavior and region presets.
-- You need OpenClaw-compatible route shapes for agent integrations.
+- You need OpenClaw plugin compatibility with dedicated camofox tool names.
 - You need both CLI and REST API control paths against the same runtime.
 
 Do **not** use this skill if you only need a simple local static page script and anti-detection is irrelevant.
@@ -145,6 +145,10 @@ Global flag reminders:
 
 ## 4) Essential API Endpoints (quick reference)
 
+API Documentation:
+- Interactive docs: `GET /api/docs` (Swagger UI)
+- OpenAPI 3.1.0 spec for a representative subset of routes: `GET /openapi.json`
+
 Core tab flow:
 ```bash
 POST   /tabs
@@ -185,10 +189,10 @@ GET    /snapshot
 POST   /act
 ```
 
-Full endpoint map (all 48): `references/api-endpoints.md`.
+Full endpoint map (all 54): `references/api-endpoints.md`.
 
 Compatibility warning:
-- `/youtube/transcript` is not registered by the current server routes.
+- The `camofox_youtube_transcript` tool has been removed from `plugin.ts`. Neither server route nor plugin tool expose this capability.
 
 ## 5) Common Patterns
 
@@ -363,7 +367,7 @@ export PROXY_PASSWORD='proxy-pass'
 ```
 
 Behavior notes:
-- Cookie import/export and evaluate endpoints enforce bearer auth only when `CAMOFOX_API_KEY` is configured.
+- Protected core and OpenClaw action/debug endpoints enforce bearer auth only when `CAMOFOX_API_KEY` is configured (includes cookie import/export, evaluate, tab/session lifecycle, navigation, interaction, downloads, tracing, console, and errors).
 - OpenClaw `/stop` requires admin key authorization.
 - `camofox download` is currently a stub/placeholder in CLI (documented intentionally).
 
@@ -406,6 +410,7 @@ screenshot --output login-result.png --user ops1
 
 - `references/cli-commands.md` — Full CLI command catalog and usage patterns.
 - `references/api-endpoints.md` — Complete REST API route map and request/response notes.
+- `references/openclaw-tools.md` — OpenClaw plugin tool list and route/tool mapping.
 - `references/anti-detection.md` — Camoufox anti-detection model, fingerprint continuity, and stealth guidance.
 - `references/authentication.md` — Auth Vault encryption model and credential workflows.
 - `references/session-management.md` — `userId` isolation, context lifecycle, and session continuity.
@@ -427,8 +432,10 @@ screenshot --output login-result.png --user ops1
 
 ## 14) Important Notes
 
-- OpenClaw support in this repository is exposed through compatibility routes, not MCP tools.
+- Plugin system in this repository is **OpenClaw plugin tools**, not MCP tools.
 - There is **no MCP server implementation** in this codebase.
+- OpenClaw plugin currently defines 18 tools in `plugin.ts`.
+- The `camofox_youtube_transcript` tool has been removed from `plugin.ts`. Neither server route nor plugin tool expose this capability.
 - CLI element refs are `eN` (for example `e1`, `e2`), not `@eN`.
 - Source of truth for development decisions: `AGENTS.md`.
 
@@ -545,9 +552,9 @@ API response handling:
 ### Appendix D — mismatch and compatibility guardrails
 
 Documented guardrails for this repository revision:
-- OpenClaw compatibility is route-based in this codebase.
+- OpenClaw plugin tool system exists and is first-class.
 - MCP server implementation does **not** exist in this codebase.
-- `/youtube/transcript` is not currently registered in route files.
+- The `camofox_youtube_transcript` tool has been removed from `plugin.ts`. The route `POST /youtube/transcript` remains unregistered.
 - CLI `download` remains placeholder/stub and should be treated as non-functional direct download command.
 
 ### Appendix E — minimum safe automation contract

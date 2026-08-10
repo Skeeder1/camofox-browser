@@ -16,9 +16,17 @@ class BrowserClient {
     const timeoutId = setTimeout(() => controller.abort(), options.timeout || this.timeout);
     
     try {
+      const headers = {
+        'Content-Type': 'application/json',
+        ...(options.headers || {}),
+      };
+      if (process.env.CAMOFOX_API_KEY && !headers.Authorization) {
+        headers.Authorization = `Bearer ${process.env.CAMOFOX_API_KEY}`;
+      }
+
       const fetchOptions = {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         signal: controller.signal
       };
       
@@ -59,9 +67,17 @@ class BrowserClient {
   }
   
   // Tab management
-  async createTab(url = null) {
+  async createTab(url = null, options = {}) {
     const body = { userId: this.userId, sessionKey: this.sessionKey };
     if (url) body.url = url;
+    if (options.proxyProfile) body.proxyProfile = options.proxyProfile;
+    if (options.proxy) body.proxy = options.proxy;
+    if (options.geoMode) body.geoMode = options.geoMode;
+    if (options.preset) body.preset = options.preset;
+    if (options.locale) body.locale = options.locale;
+    if (options.timezoneId) body.timezoneId = options.timezoneId;
+    if (options.geolocation) body.geolocation = options.geolocation;
+    if (options.viewport) body.viewport = options.viewport;
     
     const result = await this.request('POST', '/tabs', body);
     if (result.tabId) {
@@ -134,6 +150,31 @@ class BrowserClient {
     if (options.offset) params.append('offset', options.offset);
     return this.request('GET', `/tabs/${tabId}/links?${params}`);
   }
+
+  async getImages(tabId, options = {}) {
+    const params = new URLSearchParams({ userId: this.userId });
+    if (options.selector) params.append('selector', options.selector);
+    if (options.resolveBlobs !== undefined) params.append('resolveBlobs', String(options.resolveBlobs));
+    if (options.triggerLazyLoad !== undefined) params.append('triggerLazyLoad', String(options.triggerLazyLoad));
+
+    const extensions = Array.isArray(options.extensions)
+      ? options.extensions
+      : typeof options.extensions === 'string'
+        ? options.extensions.split(',')
+        : [];
+    for (const extension of extensions.map((value) => String(value).trim()).filter(Boolean)) {
+      params.append('extensions', extension);
+    }
+
+    return this.request('GET', `/tabs/${tabId}/images?${params}`);
+  }
+
+  async extractStructured(tabId, schema) {
+    return this.request('POST', `/tabs/${tabId}/extract-structured`, {
+      userId: this.userId,
+      schema,
+    });
+  }
   
   async getStats(tabId) {
     return this.request('GET', `/tabs/${tabId}/stats?userId=${this.userId}`);
@@ -155,6 +196,14 @@ class BrowserClient {
   
   async closeSession() {
     return this.request('DELETE', `/sessions/${this.userId}`);
+  }
+
+  async listTraces() {
+    return this.request('GET', `/sessions/${this.userId}/traces`);
+  }
+
+  async deleteTrace(filename) {
+    return this.request('DELETE', `/sessions/${this.userId}/traces/${encodeURIComponent(filename)}`);
   }
   
   // Cleanup all tabs created by this client

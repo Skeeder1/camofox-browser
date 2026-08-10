@@ -1,7 +1,11 @@
+import * as crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
 import type { GeolocationConfig, PresetConfig, ViewportConfig } from '../types';
+import { loadConfig } from './config';
+
+const CONFIG_PRESETS = loadConfig();
 
 // Built-in preset definitions
 export const BUILT_IN_PRESETS: Record<string, PresetConfig> = {
@@ -229,5 +233,20 @@ export function resolveContextOptions(params: unknown): ResolvedContextOptions |
   return resolved as ResolvedContextOptions;
 }
 
+/**
+ * Generate a deterministic hash for context options.
+ * Used as part of the session key to isolate different presets.
+ */
+export function contextHash(opts: ResolvedContextOptions | null): string {
+  if (!opts) return '';
+  const canonical = JSON.stringify({
+    l: opts.locale,
+    t: opts.timezoneId,
+    g: opts.geolocation ? `${opts.geolocation.latitude},${opts.geolocation.longitude}` : undefined,
+    v: opts.viewport ? `${opts.viewport.width}x${opts.viewport.height}` : undefined,
+  });
+  return ':' + crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 8);
+}
+
 // Load custom presets on module load
-loadCustomPresets(process.env.CAMOFOX_PRESETS_FILE);
+loadCustomPresets(CONFIG_PRESETS.presetsFile);

@@ -65,6 +65,7 @@ camofox server status
 
 ## API Basics
 - Base URL: `http://localhost:9377`
+- API Documentation: `GET /api/docs` (Swagger UI), `GET /openapi.json` (OpenAPI 3.1.0 spec for a representative subset of routes)
 - Health: `GET /health`
 - Create tab: `POST /tabs` with `{ userId, sessionKey|listItemId, url? }`
 - List tabs: `GET /tabs?userId=...`
@@ -74,6 +75,8 @@ camofox server status
 - Evaluate JS: `POST /tabs/:tabId/evaluate`, `POST /tabs/:tabId/evaluate-extended`
 - Close tab/session: `DELETE /tabs/:tabId`, `DELETE /sessions/:userId`
 - Cookie import/export: `POST /sessions/:userId/cookies`, `GET /tabs/:tabId/cookies`
+
+Protected endpoints require `Authorization: Bearer $CAMOFOX_API_KEY` only when `CAMOFOX_API_KEY` is set; `POST /stop` always requires `x-admin-key` via `CAMOFOX_ADMIN_KEY`.
 
 Most core success responses are structured as JSON, commonly including `ok: true` on action-style endpoints.
 

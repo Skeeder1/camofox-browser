@@ -73,3 +73,16 @@ Command handlers should:
 - Cover fallback behavior (new API path -> legacy alias) when relevant.
 - Prefer deterministic fixtures over network-dependent assertions.
 - Keep tests isolated by user/session identity.
+
+## Compatibility & Deprecation
+
+### During Preview (Phase 1)
+- Aliases are additive-only: old names continue working alongside new names.
+- Sidecar files use versioned envelopes — see `src/utils/sidecar-version.ts`.
+- On incompatible local state: throw with actionable error message, never silently regenerate or ignore.
+- On deprecated field in request: accept silently, use the canonical field internally.
+- On deprecated endpoint: route to the canonical implementation, do not duplicate logic.
+
+### Alias Removal Criteria (Post-Preview)
+- At least one major version with deprecation notice in CHANGELOG.
+- GA readiness review approves removal with documented migration path.
