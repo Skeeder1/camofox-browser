@@ -7,6 +7,58 @@
 [![Node](https://img.shields.io/badge/Node-20%2B-green)](package.json)
 [![npm](https://img.shields.io/npm/v/camofox-browser)](https://www.npmjs.com/package/camofox-browser)
 
+## About this fork
+
+This is a fork of [redf0x1/camofox-browser](https://github.com/redf0x1/camofox-browser),
+kept in sync with upstream and carrying a small number of operational fixes.
+
+**Base:** upstream **v2.4.6**
+
+It is the browser engine underneath
+[Skeeder1/camofox-mcp](https://github.com/Skeeder1/camofox-mcp): the MCP server
+is an adapter, and everything that determines whether you are detected —
+Camoufox, the fingerprint, the TLS stack — lives here. Keeping this repository
+current matters more than anything in the layer above it.
+
+### Fork-specific changes
+
+| Change | Why |
+| --- | --- |
+| `express.json` body limit raised 100kb → **5mb** (`src/server.ts`) | A cookie jar grows past 100kb on any long-lived session (174KB observed on LeBonCoin). At the upstream limit, `load_profile` fails with *request entity too large* and silently falls back to a stale profile, so the session you thought you restored is not the one you get. |
+| Click timeout is `CLICK_TIMEOUT_MS`, default **20s**, override with `CAMOFOX_CLICK_TIMEOUT_MS` (`src/services/tab.ts`) | Playwright's 5s default is too tight on SPA sites where the target is still hydrating: the click times out and falls through to the mouse sequence, and that extra round trip is what actually made clicks flaky. |
+| `.cursor/` rules tree removed | Editor-specific config for a tool this fork does not use. Conventions live in `CONVENTIONS.md`. |
+
+### Branches
+
+| Branch | Contents |
+| --- | --- |
+| `main` | upstream v2.4.6 plus the changes above |
+| `local-fixes-v2.1.1` | the pre-sync state, kept as a reference point |
+
+### Staying current
+
+```bash
+git remote add upstream https://github.com/redf0x1/camofox-browser.git   # once
+git fetch upstream --tags
+git merge upstream/main
+```
+
+Two things that bit during the v2.1.1 → v2.4.6 sync and will likely bite again:
+
+- The merge can leave **new upstream files out of the index**. After resolving,
+  compare and restore what is missing, otherwise the build fails on imports that
+  look inexplicable:
+  ```bash
+  comm -13 <(git ls-files src/ | sort) <(git ls-tree -r --name-only upstream/main -- src/ | sort)
+  ```
+- An auto-merge can silently **drop an exported symbol** that other modules
+  import (`contextHash` in `src/utils/presets.ts`). `npx tsc --noEmit` catches
+  it; a plain `git merge` reporting success does not.
+
+Resolve architectural conflicts in upstream's favour and re-apply the two fixes
+above on top. They are small and deliberately isolated for exactly that reason.
+
+
 ## Table of Contents
 
 - [Why CamoFox?](#why-camofox)
