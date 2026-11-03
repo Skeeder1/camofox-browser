@@ -1062,15 +1062,25 @@ export function buildRefsFromAriaSnapshot(ariaYaml: string | null): Map<string, 
 	return refs;
 }
 
-export async function getAriaSnapshot(page: Page): Promise<string | null> {
+export async function getAriaSnapshot(page: Page, focusSelector: string = 'body'): Promise<string | null> {
 	if (!page || page.isClosed()) return null;
 	await waitForPageReady(page, { waitForNetwork: false });
+	const target = focusSelector && focusSelector.trim() ? focusSelector.trim() : 'body';
 	try {
-		return await page.locator('body').ariaSnapshot({ timeout: 10000 });
+		return await page.locator(target).first().ariaSnapshot({ timeout: 10000 });
 	} catch {
-		log('warn', 'ariaSnapshot failed, retrying');
+		log('warn', 'ariaSnapshot failed, retrying', { selector: target });
 		await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
-		return page.locator('body').ariaSnapshot({ timeout: 10000 });
+		try {
+			return await page.locator(target).first().ariaSnapshot({ timeout: 10000 });
+		} catch {
+			// A bad/unmatched focus selector must never blank the snapshot.
+			if (target !== 'body') {
+				log('warn', 'focus selector failed, falling back to body', { selector: target });
+				return page.locator('body').ariaSnapshot({ timeout: 10000 });
+			}
+			throw new Error('ariaSnapshot failed');
+		}
 	}
 }
 
@@ -1305,14 +1315,66 @@ export async function navigateTab(
 	});
 }
 
-export async function snapshotTab(tabState: TabState): Promise<{ url: string; snapshot: string; refsCount: number }>{
-	const ariaYaml = await getAriaSnapshot(tabState.page);
-	tabState.refs = buildRefsFromAriaSnapshot(ariaYaml);
-	const annotatedYaml = annotateAriaYamlWithRefs(ariaYaml, tabState.refs);
+export interface SnapshotScopeOptions {
+	/** CSS selector to scope the accessibility snapshot to a subtree. */
+	focusSelector?: string;
+	/** Keep only nodes whose ARIA role matches one of these; ancestors are preserved. */
+	rolesFilter?: string[];
+	/** Hard cap on the number of snapshot lines returned. */
+	maxLines?: number;
+}
+
+/**
+ * Keep lines whose role matches `roles`, plus their ancestor chain (indentation
+ * stack), so the YAML stays structurally valid for ref resolution.
+ */
+export function filterSnapshotByRoles(snapshot: string, roles: string[]): string {
+	const wanted = new Set(roles.map((r) => r.trim().toLowerCase()).filter(Boolean));
+	if (wanted.size === 0) return snapshot;
+
+	const lines = snapshot.split('\n');
+	const keep = new Array<boolean>(lines.length).fill(false);
+	const stack: Array<{ indent: number; index: number }> = [];
+
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const indent = line.length - line.trimStart().length;
+
+		while (stack.length > 0 && stack[stack.length - 1].indent >= indent) stack.pop();
+		stack.push({ indent, index: i });
+
+		const match = /^\s*-\s+([a-zA-Z][\w-]*)/.exec(line);
+		if (match && wanted.has(match[1].toLowerCase())) {
+			for (const entry of stack) keep[entry.index] = true;
+		}
+	}
+
+	return lines.filter((_, i) => keep[i]).join('\n');
+}
+
+export async function snapshotTab(
+	tabState: TabState,
+	options: SnapshotScopeOptions = {},
+): Promise<{ url: string; snapshot: string; refsCount: number; scoped?: boolean }> {
+	const focus = options.focusSelector?.trim();
+	const hasRoles = Array.isArray(options.rolesFilter) && options.rolesFilter.length > 0;
+	const hasMaxLines = typeof options.maxLines === 'number' && options.maxLines > 0;
+
+	// Scoping at the DOM level is preferable: it lets Playwright build a much
+	// smaller tree instead of us trimming a huge string afterwards.
+	const ariaYaml = await getAriaSnapshot(tabState.page, focus || 'body');
+	tabState.refs = buildRefsFromAriaSnapshot(ariaYaml ?? '');
+	const annotatedYaml = annotateAriaYamlWithRefs(ariaYaml ?? '', tabState.refs);
+
+	let output = annotatedYaml;
+	if (hasRoles) output = filterSnapshotByRoles(output, options.rolesFilter!);
+	if (hasMaxLines) output = output.split('\n').slice(0, options.maxLines).join('\n');
+
 	return {
 		url: tabState.page.url(),
-		snapshot: annotatedYaml,
+		snapshot: output,
 		refsCount: tabState.refs.size,
+		scoped: Boolean(focus || hasRoles || hasMaxLines),
 	};
 }
 

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+- `POST /tabs/:tabId/snapshot` accepts `focusSelector`, `rolesFilter` and `maxLines` so an accessibility snapshot can be scoped to a subtree, filtered by ARIA role, or capped. `filterSnapshotByRoles` keeps each matching node's ancestor chain, so the returned YAML stays structurally valid and refs keep resolving. On a French marketplace page this cuts a 47 kB / ~13 k-token snapshot to a few hundred characters.
+- `snapshotTab()` takes a `SnapshotScopeOptions` argument and reports `scoped: true` when any filter was applied.
+
+### Fixed
+- Scoped snapshots were unusable end to end: the MCP layer has always sent those parameters in a POST body, but the server only exposed a GET route, so every scoped call failed with `Cannot POST /tabs/<id>/snapshot`. The GET route is unchanged and still the offset-pagination path.
+- An unmatched `focusSelector` no longer blanks the snapshot: the snapshot falls back to `body` and logs a warning instead of returning an empty tree.
+
 ## [2.4.6] - 2026-06-17
 
 ### Fixed

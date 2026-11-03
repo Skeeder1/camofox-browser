@@ -750,6 +750,73 @@ router.get('/tabs/:tabId/snapshot', async (req: Request<{ tabId: string }, unkno
 	}
 });
 
+// Snapshot (scoped) — POST counterpart of the GET route below.
+//
+// The MCP layer sends focusSelector / rolesFilter / maxLines in a JSON body.
+// Without this route the request fell through to Express' 404 handler and the
+// whole scoped-snapshot feature was unusable.
+router.post('/tabs/:tabId/snapshot', async (req: Request<{ tabId: string }, unknown, {
+	userId?: unknown;
+	offset?: number;
+	focusSelector?: unknown;
+	rolesFilter?: unknown;
+	maxLines?: unknown;
+}>, res: Response) => {
+	try {
+		if (CONFIG.apiKey && !isAuthorizedWithApiKey(req, CONFIG.apiKey)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
+		const { userId, focusSelector, rolesFilter, maxLines } = req.body ?? {};
+		if (!userId) return res.status(400).json({ error: 'userId required' });
+
+		const tabId = req.params.tabId;
+		const found = findTabById(tabId, String(userId));
+		if (!found) return res.status(404).json({ error: 'Tab not found' });
+
+		const { tabState } = found;
+		tabState.toolCalls++;
+
+		const rawOffset = Number(req.body?.offset);
+		const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
+
+		const roles = Array.isArray(rolesFilter)
+			? rolesFilter.map(String)
+			: typeof rolesFilter === 'string'
+				? rolesFilter.split(',').map((r) => r.trim())
+				: [];
+
+		const raw = await withUserLimit(String(userId), CONFIG.maxConcurrentPerUser, () =>
+			withTimeout(
+				snapshotTab(tabState, {
+					focusSelector: typeof focusSelector === 'string' ? focusSelector : undefined,
+					rolesFilter: roles,
+					maxLines: Number.isFinite(Number(maxLines)) && Number(maxLines) > 0 ? Math.floor(Number(maxLines)) : undefined,
+				}),
+				CONFIG.handlerTimeoutMs,
+				'snapshot',
+			),
+		);
+
+		const result = buildSnapshotPayload(raw, offset);
+		log('info', 'snapshot (scoped)', {
+			reqId: req.reqId,
+			tabId,
+			url: result.url,
+			snapshotLen: result.snapshot.length,
+			refsCount: result.refsCount,
+			focusSelector: typeof focusSelector === 'string' ? focusSelector : null,
+			roles: roles.length,
+			maxLines: maxLines ?? null,
+		});
+		return res.json({ ...result, scoped: true });
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		log('error', 'scoped snapshot failed', { reqId: req.reqId, tabId: req.params.tabId, error: message });
+		return res.status(getRouteErrorStatus(err)).json({ error: safeError(err) });
+	}
+});
+
 // Wait for page ready
 router.post('/tabs/:tabId/wait', async (req: Request<{ tabId: string }, unknown, { userId?: unknown; timeout?: number; waitForNetwork?: boolean }>, res: Response) => {
 	try {

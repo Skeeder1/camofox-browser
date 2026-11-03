@@ -309,6 +309,62 @@ export function buildOpenapiSpec(serverUrl = '.'): OpenAPIV3_1.Document {
 					},
 				},
 			},
+			post: {
+				summary: 'Get scoped page snapshot',
+				description:
+					'Same payload as GET, but scopes the accessibility tree before returning it: focusSelector limits the snapshot to a subtree, rolesFilter keeps only the listed ARIA roles (ancestors preserved so refs still resolve), maxLines caps the result. Use it to keep an LLM context small on dense pages.',
+				tags: ['Core'],
+				security: [{ bearerAuth: [] }],
+				parameters: [
+					{
+						name: 'tabId',
+						in: 'path',
+						required: true,
+						schema: { type: 'string' },
+					},
+				],
+				requestBody: {
+					required: true,
+					content: {
+						'application/json': {
+							schema: {
+								type: 'object',
+								properties: {
+									userId: { type: 'string' },
+									offset: { type: 'number' },
+									focusSelector: { type: 'string' },
+									rolesFilter: { type: 'array', items: { type: 'string' } },
+									maxLines: { type: 'number' },
+								},
+								required: ['userId'],
+							},
+						},
+					},
+				},
+				responses: {
+					'200': {
+						description: 'Scoped snapshot retrieved',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										url: { type: 'string' },
+										snapshot: { type: 'string' },
+										refsCount: { type: 'number' },
+										offset: { type: 'number' },
+										truncated: { type: 'boolean' },
+										totalChars: { type: 'number' },
+										hasMore: { type: 'boolean' },
+										nextOffset: { anyOf: [{ type: 'number' }, { enum: [null] }] },
+										scoped: { type: 'boolean' },
+									},
+								},
+							},
+						},
+					},
+				},
+			},
 		},
 		'/tabs/{tabId}/click': {
 			post: {

@@ -112,6 +112,7 @@ above on top. They are small and deliberately isolated for exactly that reason.
 - **TypeScript** — strict mode, typed request shapes, modular Express routes
 - **YouTube Transcript Extraction** — yt-dlp + browser fallback (service-level; no public API route currently exposed)
 - **Snapshot Pagination** — offset-based windowing for large page snapshots
+- **Scoped Snapshots** — `focusSelector`, `rolesFilter` and `maxLines` on `POST /tabs/:id/snapshot` to return only the subtree or ARIA roles you need (keeps ancestors so refs stay valid)
 - **Image Listing Route** — image-only extraction over the shared resource extractor with selector, extension, lazy-load, and blob-resolution controls
 - **Structured Extract** — deterministic schema-driven JSON extraction across core API, CLI, and OpenClaw without arbitrary JavaScript
 - **Browser Health Monitoring** — health probe with recovery/degraded state tracking
